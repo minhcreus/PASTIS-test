@@ -973,8 +973,13 @@ def _(
     resolve_source,
     run_cache,
 ):
-    mo.stop(not run_cache.value, mo.md('*Press ① to fetch and preprocess.*'))
-    RAW_ROOT, source_note = resolve_source(USE_IDS, WORK)
+    CACHE_TAG = WORK / 'cache' / f'{cfg.tag()}_n{len(USE_IDS)}'
+    CACHE_READY = (CACHE_TAG / 'manifest.json').exists()
+    mo.stop(not run_cache.value and (not CACHE_READY), mo.md('*Press ① to fetch and preprocess.*'))
+    # run_button.value resets to False once dependent cells finish, so gating on the
+    # button alone would wipe `cache` the next time anything upstream changed. Once
+    # the cache exists we just reload it -- cheap, and downstream stays alive.
+    RAW_ROOT, source_note = (CACHE_TAG, 'cache already on disk') if CACHE_READY else resolve_source(USE_IDS, WORK)
     norm_ids = [i for i in RUNS[FOLDS[0]]['train'] if i in set(USE_IDS)]
     with mo.status.progress_bar(total=len(USE_IDS), title='preprocessing') as bar_cache:
         CACHE_DIR = build_cache(RAW_ROOT, MAN, USE_IDS, cfg, WORK / 'cache', norm_ids=norm_ids, progress=bar_cache.update)
@@ -984,12 +989,11 @@ def _(
         cov = '  '.join((f'{p}={cache.coverage(_sp[p])[0]}/{cache.coverage(_sp[p])[1]}' for p in ('train', 'val', 'test')))
         lines.append(f'fold {_fold_key}: {cov}')
     mo.md('```\n' + '\n'.join(lines) + '\n```')
-    return (cache,)
+    return CACHE_DIR, cache
 
 
 @app.cell
-def _(VOID_CLASS, cache, mo, np, plt, run_cache):
-    mo.stop(not run_cache.value)
+def _(VOID_CLASS, cache, np, plt):
     pi, ti = (0, min(10, cache.x.shape[1] - 1))
     xv = cache.denormalize(np.asarray(cache.x[pi, ti], dtype=np.float32))
     rgb_img = np.stack([xv[2], xv[1], xv[0]], -1)
@@ -1021,8 +1025,7 @@ def _(mo):
 
 
 @app.cell
-def _(CLASS_NAMES, N_CLASSES, cache, mo, np, plt, run_cache):
-    mo.stop(not run_cache.value, mo.md('*Cached data needed — press ① first.*'))
+def _(CLASS_NAMES, N_CLASSES, cache, np, plt):
     eda_fold_counts = {}
     for fold_id in sorted(set(cache.folds.tolist())):
         rows = np.flatnonzero(cache.folds == fold_id)
@@ -1045,8 +1048,7 @@ def _(CLASS_NAMES, N_CLASSES, cache, mo, np, plt, run_cache):
 
 
 @app.cell
-def _(CLASS_NAMES, cache, eda_crop_ids, eda_fold_counts, mo, run_cache):
-    mo.stop(not run_cache.value)
+def _(CLASS_NAMES, cache, eda_crop_ids, eda_fold_counts, mo):
     eda_missing = {f: [CLASS_NAMES[c] for c in eda_crop_ids if eda_fold_counts[f][c] == 0] for f in sorted(eda_fold_counts)}
     eda_rows = ['| fold | patches | labelled px | background | void | classes present | absent |', '|---|---:|---:|---:|---:|---:|---|']
     for _f in sorted(eda_fold_counts):
@@ -1080,14 +1082,15 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    run_eda = mo.ui.run_button(label="Run spectral / temporal EDA (sampled)")
-    run_eda
-    return (run_eda,)
+    EDA_SAMPLE_N = 40   # training patches sampled for the spectral pass
+    mo.md(f"Sampling {EDA_SAMPLE_N} training patches for the spectral pass.")
+    return (EDA_SAMPLE_N,)
 
 
 @app.cell
 def _(
     CLASS_NAMES,
+    EDA_SAMPLE_N,
     FOLDS,
     N_CLASSES,
     RUNS,
@@ -1096,15 +1099,11 @@ def _(
     mo,
     np,
     plt,
-    run_cache,
-    run_eda,
 ):
-    mo.stop(not run_cache.value, mo.md('*Press ① first.*'))
-    mo.stop(not run_eda.value, mo.md('*Press the button above — samples ~60 training patches.*'))
-    eda_train_ids = sorted(set(RUNS[FOLDS[0]]['train']))
     # training rows only, so nothing here is informed by val or test
+    eda_train_ids = sorted(set(RUNS[FOLDS[0]]['train']))
     eda_rows_tr = cache.indices_for(eda_train_ids)
-    eda_sample = eda_rows_tr[:60] if len(eda_rows_tr) > 60 else eda_rows_tr
+    eda_sample = eda_rows_tr[:EDA_SAMPLE_N] if len(eda_rows_tr) > EDA_SAMPLE_N else eda_rows_tr
     EDA_BIN = 10
     eda_nbins = 366 // EDA_BIN + 1
     eda_sum = np.zeros((N_CLASSES, eda_nbins))
@@ -1114,8 +1113,8 @@ def _(
         for _r in eda_sample:
             arr = cache.denormalize(np.asarray(cache.x[_r], dtype=np.float32))
             valid_t = cache.valid[_r]
-            doys = cache.doy[_r]
-            red, nir, blue = (arr[:, 2], arr[:, 6], arr[:, 0])  # (T,C,H,W)
+            doys = cache.doy[_r]  # (T,C,H,W)
+            red, nir, blue = (arr[:, 2], arr[:, 6], arr[:, 0])
             ndvi = (nir - red) / np.maximum(nir + red, 1e-06)
             tgt = cache.target[_r]
             for _t in range(arr.shape[0]):
@@ -1156,11 +1155,9 @@ def _(
 
 
 @app.cell
-def _(N_BANDS, cache, eda_sample, mo, np, run_cache, run_eda):
-    mo.stop(not run_cache.value)
-    mo.stop(not run_eda.value)
-    eda_norm_sample = np.asarray(cache.x[eda_sample[:12]], dtype=np.float32)
+def _(N_BANDS, cache, eda_sample, mo, np):
     # does the robust scaler actually centre the data?
+    eda_norm_sample = np.asarray(cache.x[eda_sample[:12]], dtype=np.float32)
     eda_band_rows = ['| band | p05 | median | p95 | after scaling: median | IQR |', '|---|---:|---:|---:|---:|---:|']
     EDA_BAND_NAMES = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12']
     for _b in range(N_BANDS):
@@ -1184,21 +1181,8 @@ def _(mo):
 
 
 @app.cell
-def _(
-    FOLDS,
-    RUNS,
-    VOID_CLASS,
-    cache,
-    eda_rows_tr,
-    mo,
-    np,
-    plt,
-    run_cache,
-    run_eda,
-):
-    mo.stop(not run_cache.value)
-    eda_gal = eda_rows_tr[:6] if run_eda.value else cache.indices_for(sorted(set(RUNS[FOLDS[0]]['train'])))[:6]
-    eda_gal = eda_gal[:6]
+def _(VOID_CLASS, cache, eda_rows_tr, np, plt):
+    eda_gal = eda_rows_tr[:6]
     fig_eda4, ax_eda4 = plt.subplots(2, len(eda_gal), figsize=(2.1 * len(eda_gal), 4.6), squeeze=False)
     for _col, _r in enumerate(eda_gal):
         _t = min(10, cache.x.shape[1] - 1)
@@ -1272,8 +1256,14 @@ def _(
     ui_mask,
     ui_pre_epochs,
 ):
-    mo.stop(not run_pre.value, mo.md('*Press ② to pretrain. ~1.5–2 h per fold on a GPU at 40 epochs.*'))
+    def ckpt_path(fold_key):
+        return WORK / f'pretrain_fold{fold_key}_m{int(ui_mask.value * 100)}' / 'best.pt'
+    PRE_READY = all((ckpt_path(f).exists() for f in FOLDS))
+    mo.stop(not run_pre.value and (not PRE_READY), mo.md('*Press ② to pretrain. ~1.5–2 h per fold on a GPU at 40 epochs.*'))
 
+    # run_button.value resets to False once dependent cells finish, so gating on the
+    # button alone would destroy CKPTS the next time anything upstream changed.
+    # Once checkpoints exist we load them instead of stopping.
     def pretrain_fold(fold_key):
         pool = set(RUNS[fold_key]['train'])
         held = set(RUNS[fold_key]['val']) | set(RUNS[fold_key]['test'])
@@ -1317,27 +1307,37 @@ def _(
             hist.append(ep_loss)
             sch.step(ep_loss)
             if ep_loss <= min(hist):
-                torch.save({'encoder': enc.state_dict(), 'loss': ep_loss, 'epoch': ep, 'mask_rate': ui_mask.value, 'fold': fold_key, 'split_manifest_sha256': MAN.sha256, 'pretrain_ids': sorted(pool)}, out / 'best.pt')
+                torch.save({'encoder': enc.state_dict(), 'decoder': dec.state_dict(), 'loss': ep_loss, 'epoch': ep, 'history': list(hist), 'mask_rate': ui_mask.value, 'fold': fold_key, 'split_manifest_sha256': MAN.sha256, 'pretrain_ids': sorted(pool)}, out / 'best.pt')
             yield (fold_key, ep, ep_loss, out / 'best.pt', hist, enc, dec)
-    CKPTS, HISTORIES = ({}, {})
-    VIZ = {}
-    total_steps = len(FOLDS) * ui_pre_epochs.value
+    CKPTS, HISTORIES, VIZ = ({}, {}, {})
+    todo = [f for f in FOLDS if not ckpt_path(f).exists()]
+    total_steps = max(1, len(todo) * ui_pre_epochs.value)
     with mo.status.progress_bar(total=total_steps, title='pretraining') as bar_pre:
         for fk in FOLDS:
-            for _fold_key, ep, ep_loss, ckpt, hist, enc_i, dec_i in pretrain_fold(fk):
-                bar_pre.update()
-            CKPTS[_fold_key] = ckpt
-            HISTORIES[f'fold {_fold_key}'] = hist
-            VIZ[_fold_key] = (enc_i, dec_i)
-            print(f'fold {_fold_key}: best masked MSE {min(hist):.5f} -> {ckpt}')
+            if fk in todo:
+                for _fold_key, ep, ep_loss, ckpt, hist, enc_i, dec_i in pretrain_fold(fk):
+                    bar_pre.update()
+                CKPTS[_fold_key] = ckpt
+                HISTORIES[f'fold {_fold_key}'] = hist
+                VIZ[_fold_key] = (enc_i, dec_i)
+                print(f'fold {_fold_key}: trained, best masked MSE {min(hist):.5f}')
+            else:
+                st = torch.load(ckpt_path(fk), map_location='cpu')
+                enc_l = UBARN(in_ch=N_BANDS, d_model=64, d_hidden=128, n_layers=3, n_heads=4).to(DEVICE)
+                enc_l.load_state_dict(st['encoder'])
+                dec_l = LinearDecoder(64, N_BANDS).to(DEVICE)
+                if 'decoder' in st:
+                    dec_l.load_state_dict(st['decoder'])
+                CKPTS[fk] = ckpt_path(fk)
+                HISTORIES[f'fold {fk}'] = st.get('history', [st['loss']])
+                VIZ[fk] = (enc_l, dec_l)
+                print(f'fold {fk}: loaded existing checkpoint, loss {st['loss']:.5f}')
     mo.md('Pretraining done: ' + ', '.join((f'fold {k}' for k in CKPTS)))
     return CKPTS, HISTORIES, VIZ
 
 
 @app.cell
-def _(HISTORIES, mo, plt, run_pre):
-    mo.stop(not run_pre.value)
-
+def _(HISTORIES, plt):
     fig_loss, ax_loss = plt.subplots(figsize=(6, 3))
     for tag, hist_v in HISTORIES.items():
         ax_loss.plot(hist_v, lw=1.5, label=tag)
@@ -1355,17 +1355,14 @@ def _(
     RUNS,
     VIZ,
     cache,
-    mo,
     np,
     permutation_mask,
     plt,
-    run_pre,
     torch,
     ui_mask,
 ):
-    mo.stop(not run_pre.value)
-    viz_fold = FOLDS[-1]
     # reconstruction on a HELD-OUT patch, so this is a real check not memorisation
+    viz_fold = FOLDS[-1]
     enc_v, dec_v = VIZ[viz_fold]
     enc_v.eval()
     dec_v.eval()
@@ -1474,24 +1471,39 @@ def _(mo):
 
 @app.cell
 def _(
+    CACHE_DIR,
     FOLDS,
     PCTS,
     REGIMES,
     RUNS,
     SEEDS,
     VAL_FOLD,
+    WORK,
     cache,
+    json,
     mo,
     np,
     run_dn,
     scarce_subset,
+    ui_mask,
+    ui_max_epochs,
+    ui_patience,
     ui_val_cap,
 ):
-    mo.stop(not run_dn.value, mo.md('*Press 3. Check the cost estimate above first.*'))
+    RESULTS_FILE = WORK / 'results_downstream.json'
+    RUN_SIG = {'folds': FOLDS, 'val_fold': VAL_FOLD, 'pcts': PCTS, 'seeds': SEEDS, 'regimes': REGIMES, 'max_epochs': ui_max_epochs.value, 'patience': ui_patience.value, 'val_cap': ui_val_cap.value, 'cache': str(CACHE_DIR), 'mask_rate': ui_mask.value}
+    DN_READY = False
+    if RESULTS_FILE.exists():
+        with open(RESULTS_FILE) as fh_prev:
+            prev = json.load(fh_prev)
+        DN_READY = prev.get('signature') == RUN_SIG
+    mo.stop(not run_dn.value and (not DN_READY), mo.md('*Press 3. Check the cost estimate above first.*'))
 
     def subset_key(fold_key, pct, seed):
         return f'f{fold_key}_p{pct}_s{seed}'
 
+    # as above: results survive a button reset, and a changed setting invalidates
+    # them because the signature no longer matches
     def make_label_subset(fold_key, pct, seed):
         """Patch IDs for one (fold, fraction, seed). Independent of the method.
 
@@ -1521,7 +1533,7 @@ def _(
             sizes = {len(SUBSETS[subset_key(_f, _p, sd)]) for sd in SEEDS}
             sub_lines.append(f'   {_p:>3}% -> {sorted(sizes)} patches across seeds {SEEDS}')
     mo.md('```' + sub_nl + sub_nl.join(sub_lines) + sub_nl + '```')
-    return SUBSETS, VAL_IDS, subset_key
+    return DN_READY, RESULTS_FILE, RUN_SIG, SUBSETS, VAL_IDS, prev, subset_key
 
 
 @app.cell
@@ -1529,13 +1541,16 @@ def _(
     CKPTS,
     ConfusionMeter,
     DEVICE,
+    DN_READY,
     FOLDS,
     N_BANDS,
     N_CLASSES,
     N_RUNS,
     PCTS,
     REGIMES,
+    RESULTS_FILE,
     RUNS,
+    RUN_SIG,
     SEEDS,
     SUBSETS,
     SegmentationModel,
@@ -1549,15 +1564,13 @@ def _(
     make_dataset,
     mo,
     np,
-    run_dn,
+    prev,
     subset_key,
     torch,
     ui_bs,
     ui_max_epochs,
     ui_patience,
 ):
-    mo.stop(not run_dn.value)
-
     def build_model(mode, fold_key):
         enc = UBARN(in_ch=N_BANDS, d_model=64, d_hidden=128, n_layers=3, n_heads=4)
         if mode in ('LP', 'FT'):
@@ -1610,31 +1623,36 @@ def _(
             model.load_state_dict(best_state)
         return (best, ran)
     results = []
-    with mo.status.progress_bar(total=N_RUNS, title='downstream runs') as bar_dn:
-        for _fold_key in FOLDS:
-            va_dl = loader(make_dataset(cache, VAL_IDS[_fold_key]), ui_bs.value, shuffle=False)
-            te_dl = loader(make_dataset(cache, cache.indices_for(RUNS[_fold_key]['test'])), ui_bs.value, shuffle=False)
-            for pct in PCTS:
-                for seed in SEEDS:
-                    ids_used = SUBSETS[subset_key(_fold_key, pct, seed)]
-                    tr_rows = cache.indices_for(ids_used)
-                    tr_dl = loader(make_dataset(cache, tr_rows, augment=True), ui_bs.value, shuffle=True)
-                    for _mode in REGIMES:
-                        torch.manual_seed(seed)
-                        np.random.seed(seed)
-                        _m = build_model(_mode, _fold_key)
-                        val_best, epochs_run = train_with_early_stop(_m, tr_dl, va_dl, ui_max_epochs.value, ui_patience.value)
-                        sc = evaluate(_m, te_dl).scores()
-                        results.append({'fold': _fold_key, 'pct': pct, 'seed': seed, 'regime': _mode, 'n_train': len(tr_rows), 'epochs_run': epochs_run, 'val_mIoU': val_best, 'subset_sig': ','.join(sorted(ids_used))[:64], **{k: sc[k] for k in ('Kappa', 'OA', 'F1', 'mIoU')}})
-                        del _m
-                        if DEVICE == 'cuda':
-                            torch.cuda.empty_cache()
-                        bar_dn.update()
-    with open(WORK / 'results_downstream.json', 'w') as fh:
-        json.dump(results, fh, indent=2)
-    with open(WORK / 'label_subsets.json', 'w') as fh:
-        json.dump(SUBSETS, fh, indent=2)
-    mo.md(f'{len(results)} runs finished, saved to `{WORK}`')
+    with mo.status.progress_bar(total=0 if DN_READY else N_RUNS, title='downstream runs') as bar_dn:
+        if DN_READY:
+            results = prev['runs']
+            print(f'loaded {len(results)} runs from {RESULTS_FILE}')
+        else:
+            for _fold_key in FOLDS:
+                va_dl = loader(make_dataset(cache, VAL_IDS[_fold_key]), ui_bs.value, shuffle=False)
+                te_dl = loader(make_dataset(cache, cache.indices_for(RUNS[_fold_key]['test'])), ui_bs.value, shuffle=False)
+                for pct in PCTS:
+                    for seed in SEEDS:
+                        ids_used = SUBSETS[subset_key(_fold_key, pct, seed)]
+                        tr_rows = cache.indices_for(ids_used)
+                        tr_dl = loader(make_dataset(cache, tr_rows, augment=True), ui_bs.value, shuffle=True)
+                        for _mode in REGIMES:
+                            torch.manual_seed(seed)
+                            np.random.seed(seed)
+                            _m = build_model(_mode, _fold_key)
+                            val_best, epochs_run = train_with_early_stop(_m, tr_dl, va_dl, ui_max_epochs.value, ui_patience.value)
+                            sc = evaluate(_m, te_dl).scores()
+                            results.append({'fold': _fold_key, 'pct': pct, 'seed': seed, 'regime': _mode, 'n_train': len(tr_rows), 'epochs_run': epochs_run, 'val_mIoU': val_best, 'subset_sig': ','.join(sorted(ids_used))[:64], **{k: sc[k] for k in ('Kappa', 'OA', 'F1', 'mIoU')}})
+                            del _m
+                            if DEVICE == 'cuda':
+                                torch.cuda.empty_cache()
+                            bar_dn.update()
+    if not DN_READY:
+        with open(RESULTS_FILE, 'w') as fh:
+            json.dump({'signature': RUN_SIG, 'runs': results}, fh, indent=2)
+        with open(WORK / 'label_subsets.json', 'w') as fh:
+            json.dump(SUBSETS, fh, indent=2)
+    mo.md(f'{len(results)} runs ' + ('loaded from disk' if DN_READY else f'finished, saved to `{WORK}`'))
     return (results,)
 
 
@@ -1650,8 +1668,7 @@ def _(mo):
 
 
 @app.cell
-def _(FOLDS, PCTS, SEEDS, mo, results, run_dn):
-    mo.stop(not run_dn.value)
+def _(FOLDS, PCTS, SEEDS, mo, results):
     chk_bad = []
     for _f in FOLDS:
         for _p in PCTS:
@@ -1668,8 +1685,7 @@ def _(FOLDS, PCTS, SEEDS, mo, results, run_dn):
 
 
 @app.cell
-def _(FOLDS, PCTS, REGIMES, SEEDS, mo, np, results, run_dn):
-    mo.stop(not run_dn.value)
+def _(FOLDS, PCTS, REGIMES, SEEDS, mo, np, results):
     res_nl = chr(10)
     res_rows = ['| fraction | n | regime | Kappa | OA | F1 | mIoU | epochs |', '|---:|---:|---|---:|---:|---:|---:|---:|']
     for _p in PCTS:
@@ -1689,8 +1705,7 @@ def _(FOLDS, PCTS, REGIMES, SEEDS, mo, np, results, run_dn):
 
 
 @app.cell
-def _(FOLDS, PCTS, REGIMES, SEEDS, VAL_FOLD, mo, np, plt, results, run_dn):
-    mo.stop(not run_dn.value)
+def _(FOLDS, PCTS, REGIMES, SEEDS, VAL_FOLD, np, plt, results):
     fig_dn, axs_dn = plt.subplots(1, 4, figsize=(15, 3.4))
     dn_styles = {'LP': ('-o', '#4c72b0'), 'FT': ('-s', '#dd8452'), 'SL': ('--^', '#55a868')}
     for ax_d, metric in zip(axs_dn, ['Kappa', 'OA', 'F1', 'mIoU']):
