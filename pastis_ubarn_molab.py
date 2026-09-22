@@ -273,15 +273,7 @@ def _(Path, dataclass, json):
     # selecting folds to run
         return out
 
-    return (
-        Manifest,
-        folds_to_run,
-        load_manifest,
-        normalize_id,
-        print_report,
-        required_ids,
-        validate_split,
-    )
+    return Manifest, load_manifest, normalize_id, print_report, validate_split
 
 
 @app.cell
@@ -824,14 +816,29 @@ def _(SPLIT_MANIFEST, load_manifest, print_report, validate_split):
 
 
 @app.cell
-def _(MAN, folds_to_run, required_ids):
-    FOLDS = [1, 2]
-    RUNS = folds_to_run(MAN, FOLDS)
-    NEEDED = sorted(required_ids(RUNS))
+def _(MAN, validate_split):
+    # Fold 4 is the early-stopping set for every run, held fixed. Each test fold
+    # gets its own rotation: train = the three folds that are neither test nor val.
+    VAL_FOLD = 4
+    FOLDS = [1, 2]  # test folds; must not include VAL_FOLD
+    assert VAL_FOLD not in FOLDS, 'the early-stopping fold cannot also be a test fold'
+
+    def make_runs(manifest, test_folds, val_fold):
+        """train / val / test by fold id, with val pinned to one fold."""
+        out = {}
+        for t in test_folds:
+            out[t] = {'train': sorted((pid for pid, rec in manifest.patches.items() if rec['fold'] not in (t, val_fold))), 'val': sorted((pid for pid, rec in manifest.patches.items() if rec['fold'] == val_fold)), 'test': sorted((pid for pid, rec in manifest.patches.items() if rec['fold'] == t))}
+        return out
+    RUNS = make_runs(MAN, FOLDS, VAL_FOLD)
+    NEEDED = sorted({i for sp in RUNS.values() for part in sp.values() for i in part})
     for _fold_key, _sp in RUNS.items():
-        print(f'fold {_fold_key}: train={len(_sp['train']):5d}  val={len(_sp['val']):4d} (fold {sorted({MAN.fold_of(i) for i in _sp['val']})})  test={len(_sp['test']):4d} (fold {sorted({MAN.fold_of(i) for i in _sp['test']})})')
-    print(f'\nunique patches needed: {len(NEEDED)}')
-    return FOLDS, NEEDED, RUNS
+        tr_folds = sorted({MAN.fold_of(i) for i in _sp['train']})
+        print(f'test fold {_fold_key}: train={len(_sp['train']):5d} (folds {tr_folds})  val={len(_sp['val']):4d} (fold {VAL_FOLD})  test={len(_sp['test']):4d}')
+        rep_custom = validate_split(_sp, MAN, name=f'test fold {_fold_key}')
+        assert rep_custom['ok'], rep_custom['errors']
+    print(f'\nearly stopping on fold {VAL_FOLD} throughout')
+    print(f'unique patches needed: {len(NEEDED)}')
+    return FOLDS, NEEDED, RUNS, VAL_FOLD
 
 
 @app.cell(hide_code=True)
@@ -1018,9 +1025,9 @@ def _(CLASS_NAMES, N_CLASSES, cache, mo, np, plt, run_cache):
     mo.stop(not run_cache.value, mo.md('*Cached data needed — press ① first.*'))
     eda_fold_counts = {}
     for fold_id in sorted(set(cache.folds.tolist())):
-        _rows = np.flatnonzero(cache.folds == fold_id)
+        rows = np.flatnonzero(cache.folds == fold_id)
         tally = np.zeros(N_CLASSES, dtype=np.int64)
-        for _r in _rows:
+        for _r in rows:
             tally += np.bincount(cache.target[_r].reshape(-1), minlength=N_CLASSES)
         eda_fold_counts[int(fold_id)] = tally
     eda_crop_ids = [c for c in range(1, 19) if any((t[c] > 0 for t in eda_fold_counts.values()))]
@@ -1042,12 +1049,12 @@ def _(CLASS_NAMES, cache, eda_crop_ids, eda_fold_counts, mo, run_cache):
     mo.stop(not run_cache.value)
     eda_missing = {f: [CLASS_NAMES[c] for c in eda_crop_ids if eda_fold_counts[f][c] == 0] for f in sorted(eda_fold_counts)}
     eda_rows = ['| fold | patches | labelled px | background | void | classes present | absent |', '|---|---:|---:|---:|---:|---:|---|']
-    for f in sorted(eda_fold_counts):
-        _t = eda_fold_counts[f]
+    for _f in sorted(eda_fold_counts):
+        _t = eda_fold_counts[_f]
         tot = _t.sum()
         _lab = _t[1:19].sum()
         present = int((_t[1:19] > 0).sum())
-        eda_rows.append(f'| {f} | {int((cache.folds == f).sum())} | {_lab:,} | {100 * _t[0] / max(tot, 1):.1f}% | {100 * _t[19] / max(tot, 1):.1f}% | {present}/18 | {', '.join(eda_missing[f]) or '—'} |')
+        eda_rows.append(f'| {_f} | {int((cache.folds == _f).sum())} | {_lab:,} | {100 * _t[0] / max(tot, 1):.1f}% | {100 * _t[19] / max(tot, 1):.1f}% | {present}/18 | {', '.join(eda_missing[_f]) or '—'} |')
     mo.md(chr(10).join(eda_rows))
     return
 
@@ -1394,28 +1401,127 @@ def _(
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## Downstream
+    ## Downstream protocol
 
-    **FR** frozen encoder · **FT** fine-tuned · **e2e** random init, same
-    architecture. Run both folds and average.
+    Three regimes at every label fraction:
+
+    | | |
+    |---|---|
+    | **LP** | linear probe — encoder frozen, only the shallow classifier trains |
+    | **FT** | full fine-tune — encoder initialised from pretraining, everything trains |
+    | **SL** | supervised baseline — identical architecture, random init |
+
+    Fold 4 is the early-stopping set for all three. Each label fraction is run with
+    several seeds and reported as mean ± std. **100% is included**, so the
+    supervised baseline at full labels sits on the same axis as everything else.
+
+    The subset a given `(test fold, fraction, seed)` produces is computed **once,
+    before any training**, and every regime is handed that same list of patch IDs.
+    LP, FT and SL at seed 3 see exactly the same labelled patches — the comparison
+    is otherwise meaningless.
     """)
     return
 
 
 @app.cell
 def _(mo):
-    ui_dn_epochs = mo.ui.slider(5, 150, value=40, step=5, label="downstream epochs")
-    ui_ntrain = mo.ui.dropdown(["all", "10", "30", "100", "200"], value="all",
-                               label="training patches per fold")
-    mo.vstack([ui_dn_epochs, ui_ntrain])
-    return ui_dn_epochs, ui_ntrain
+    ui_pcts = mo.ui.multiselect(["1", "5", "10", "20", "50", "100"],
+                                value=["1", "5", "10", "20", "50", "100"],
+                                label="label fractions (%)")
+    ui_nseeds = mo.ui.dropdown(["3", "5"], value="3", label="seeds")
+    ui_max_epochs = mo.ui.slider(10, 200, value=80, step=10, label="max epochs")
+    ui_patience = mo.ui.slider(3, 30, value=10, step=1, label="early-stop patience")
+    ui_val_cap = mo.ui.slider(0, 400, value=150, step=50,
+                              label="val patches (0 = all of fold 4)")
+    mo.vstack([ui_pcts, ui_nseeds, ui_max_epochs, ui_patience, ui_val_cap])
+    return ui_max_epochs, ui_nseeds, ui_patience, ui_pcts, ui_val_cap
+
+
+@app.cell
+def _(CKPTS, FOLDS, VAL_FOLD, mo, ui_nseeds, ui_pcts):
+    PCTS = sorted(int(v) for v in ui_pcts.value)
+    SEEDS = list(range(int(ui_nseeds.value)))
+    REGIMES = ["LP", "FT", "SL"] if CKPTS else ["SL"]
+    N_RUNS = len(FOLDS) * len(PCTS) * len(SEEDS) * len(REGIMES)
+
+    est_nl = chr(10)
+    est_lines = [
+        f"regimes        : {', '.join(REGIMES)}",
+        f"label fractions: {PCTS}",
+        f"seeds          : {SEEDS}",
+        f"test folds     : {FOLDS}   (early stop on fold {VAL_FOLD})",
+        "",
+        f"total training runs: {N_RUNS}",
+    ]
+    est_unit = sum(PCTS) / 100.0 * len(SEEDS) * len(REGIMES) * len(FOLDS)
+    est_lines.append(f"cost  ~ {est_unit:.1f} x one full-label run")
+    est_lines.append("a full-label run is roughly 10 min on a GPU at 600 patches,")
+    est_lines.append(f"so budget about {est_unit * 10 / 60:.1f} h, plus pretraining.")
+    if est_unit * 10 / 60 > 7:
+        est_lines.append("")
+        est_lines.append("!! that will not fit in one 12 h session alongside pretraining.")
+        est_lines.append("   drop a seed, drop the 100% level, or lower max epochs.")
+    mo.md("```" + est_nl + est_nl.join(est_lines) + est_nl + "```")
+    return N_RUNS, PCTS, REGIMES, SEEDS
 
 
 @app.cell
 def _(mo):
-    run_dn = mo.ui.run_button(label="③ Run both folds (FR / FT / e2e)")
+    run_dn = mo.ui.run_button(label="3. Run downstream (LP / FT / SL x fractions x seeds)")
     run_dn
     return (run_dn,)
+
+
+@app.cell
+def _(
+    FOLDS,
+    PCTS,
+    REGIMES,
+    RUNS,
+    SEEDS,
+    VAL_FOLD,
+    cache,
+    mo,
+    np,
+    run_dn,
+    scarce_subset,
+    ui_val_cap,
+):
+    mo.stop(not run_dn.value, mo.md('*Press 3. Check the cost estimate above first.*'))
+
+    def subset_key(fold_key, pct, seed):
+        return f'f{fold_key}_p{pct}_s{seed}'
+
+    def make_label_subset(fold_key, pct, seed):
+        """Patch IDs for one (fold, fraction, seed). Independent of the method.
+
+        Rare-class weighted (paper Appendix B) so a 1% subset still covers the
+        scarce crops, and seeded so it is reproducible.
+        """
+        train_ids = [i for i in RUNS[fold_key]['train'] if i in cache.pos]
+        if pct >= 100:
+            return list(train_ids)
+        n = max(1, int(round(len(train_ids) * pct / 100)))
+        rows = cache.indices_for(train_ids)
+        picked = scarce_subset(cache, rows, min(n, len(rows)), seed=seed)
+        return [cache.ids[r] for r in picked]
+    SUBSETS = {subset_key(f, p, sd): make_label_subset(f, p, sd) for f in FOLDS for p in PCTS for sd in SEEDS}
+    VAL_IDS = {}
+    for _f in FOLDS:
+        va_all = cache.indices_for(RUNS[_f]['val'])
+        if ui_val_cap.value and len(va_all) > ui_val_cap.value:
+            va_pick = np.random.default_rng(12345).choice(len(va_all), size=ui_val_cap.value, replace=False)
+            va_all = va_all[np.sort(va_pick)]
+        VAL_IDS[_f] = va_all
+    sub_nl = chr(10)
+    sub_lines = [f'{len(SUBSETS)} label subsets built, shared across {len(REGIMES)} regimes', '']
+    for _f in FOLDS:
+        sub_lines.append(f'test fold {_f}:  val {len(VAL_IDS[_f])} patches (fold {VAL_FOLD}), test {len(cache.indices_for(RUNS[_f]['test']))} patches')
+        for _p in PCTS:
+            sizes = {len(SUBSETS[subset_key(_f, _p, sd)]) for sd in SEEDS}
+            sub_lines.append(f'   {_p:>3}% -> {sorted(sizes)} patches across seeds {SEEDS}')
+    mo.md('```' + sub_nl + sub_nl.join(sub_lines) + sub_nl + '```')
+    return SUBSETS, VAL_IDS, subset_key
 
 
 @app.cell
@@ -1426,9 +1532,15 @@ def _(
     FOLDS,
     N_BANDS,
     N_CLASSES,
+    N_RUNS,
+    PCTS,
+    REGIMES,
     RUNS,
+    SEEDS,
+    SUBSETS,
     SegmentationModel,
     UBARN,
+    VAL_IDS,
     VOID_CLASS,
     WORK,
     cache,
@@ -1438,29 +1550,19 @@ def _(
     mo,
     np,
     run_dn,
-    scarce_subset,
+    subset_key,
     torch,
     ui_bs,
-    ui_dn_epochs,
-    ui_ntrain,
+    ui_max_epochs,
+    ui_patience,
 ):
-    mo.stop(not run_dn.value, mo.md('*Press ③ to train and evaluate.*'))
+    mo.stop(not run_dn.value)
 
     def build_model(mode, fold_key):
         enc = UBARN(in_ch=N_BANDS, d_model=64, d_hidden=128, n_layers=3, n_heads=4)
-        if mode in ('FR', 'FT'):
+        if mode in ('LP', 'FT'):
             enc.load_state_dict(torch.load(CKPTS[fold_key], map_location='cpu')['encoder'])
-        return SegmentationModel(enc, n_classes=N_CLASSES, freeze=mode == 'FR').to(DEVICE)
-
-    def fold_loaders(fold_key, n_train, batch_size):
-        sp = RUNS[fold_key]
-        tr = cache.indices_for(sp['train'])
-        va = cache.indices_for(sp['val'])
-        te = cache.indices_for(sp['test'])
-        if n_train is not None:
-            tr = scarce_subset(cache, tr, n_train)
-        mk = lambda idx, shuf, aug: loader(make_dataset(cache, idx, augment=aug), batch_size, shuffle=shuf)
-        return (mk(tr, True, True), mk(va, False, False), mk(te, False, False), len(tr), len(te))
+        return SegmentationModel(enc, n_classes=N_CLASSES, freeze=mode == 'LP').to(DEVICE)
 
     @torch.no_grad()
     def evaluate(model, dl):
@@ -1472,14 +1574,15 @@ def _(
             meter.update(lg.argmax(1), b['y'])
         return meter
 
-    def train_head(model, tr_dl, va_dl, epochs, bar=None):
+    def train_with_early_stop(model, tr_dl, va_dl, max_epochs, patience):
+        """Early stopping on fold 4 mIoU. Returns (best_val_mIoU, epochs_run)."""
         prm = [p for p in model.parameters() if p.requires_grad]
         opt = torch.optim.Adam(prm, lr=0.001)
-        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=10, factor=0.5)
+        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=max(2, patience // 2), factor=0.5)
         scl = torch.amp.GradScaler('cuda', enabled=DEVICE == 'cuda')
         lossf = torch.nn.CrossEntropyLoss(ignore_index=VOID_CLASS)
-        best, best_state = (-1.0, None)
-        for _ in range(epochs):
+        best, best_state, stale, ran = (-1.0, None, 0, 0)
+        for ep in range(max_epochs):
             model.train()
             tot = 0.0
             for b in tr_dl:
@@ -1494,127 +1597,134 @@ def _(
                 scl.update()
                 tot += float(loss.detach())
             sch.step(tot / max(len(tr_dl), 1))
-            miou = evaluate(model, va_dl).scores()['mIoU']
-            if miou > best:
-                best = miou
+            ran = ep + 1
+            val_miou = evaluate(model, va_dl).scores()['mIoU']
+            if val_miou > best + 1e-05:
+                best, stale = (val_miou, 0)
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            if bar is not None:
-                bar.update()
+            else:
+                stale += 1
+                if stale >= patience:
+                    break
         if best_state:
             model.load_state_dict(best_state)
-        return best
-    N_TRAIN = None if ui_ntrain.value == 'all' else int(ui_ntrain.value)
-    REGIMES = ['FR', 'FT', 'e2e'] if CKPTS else ['e2e']
+        return (best, ran)
     results = []
-    with mo.status.progress_bar(total=len(FOLDS) * len(REGIMES) * ui_dn_epochs.value, title='downstream') as bar_dn:
+    with mo.status.progress_bar(total=N_RUNS, title='downstream runs') as bar_dn:
         for _fold_key in FOLDS:
-            _tr_dl, _va_dl, _te_dl, _n_tr, n_te = fold_loaders(_fold_key, N_TRAIN, ui_bs.value)
-            for _mode in REGIMES:
-                torch.manual_seed(_fold_key)
-                _m = build_model(_mode, _fold_key)
-                train_head(_m, _tr_dl, _va_dl, ui_dn_epochs.value, bar=bar_dn)
-                _sc = evaluate(_m, _te_dl).scores()
-                results.append({'fold': _fold_key, 'regime': _mode, 'n_train': _n_tr, 'n_test': n_te, **{k: _sc[k] for k in ('Kappa', 'OA', 'F1', 'mIoU')}})
-                del _m
-                if DEVICE == 'cuda':
-                    torch.cuda.empty_cache()
-    with open(WORK / 'results_2fold.json', 'w') as _fh:
-        json.dump(results, _fh, indent=2)
-    _rows = ['| fold | regime | train | test | Kappa | OA | F1 | mIoU |', '|---|---|---:|---:|---:|---:|---:|---:|']
-    for _r in results:
-        _rows.append(f'| {_r['fold']} | {_r['regime']} | {_r['n_train']} | {_r['n_test']} | {_r['Kappa']:.4f} | {_r['OA']:.4f} | {_r['F1']:.4f} | {_r['mIoU']:.4f} |')
-    _rows.append('')
-    _rows.append('**Mean across folds**')
-    _rows.append('')
-    _rows.append('| regime | Kappa | OA | F1 | mIoU |')
-    _rows.append('|---|---:|---:|---:|---:|')
-    for _mode in REGIMES:
-        sel = [r for r in results if r['regime'] == _mode]
-        cellsm = []
-        for _k in ('Kappa', 'OA', 'F1', 'mIoU'):
-            _v = np.array([r[_k] for r in sel])
-            cellsm.append(f'{_v.mean():.4f} ±{_v.std():.4f}')
-        _rows.append(f'| {_mode} | ' + ' | '.join(cellsm) + ' |')
-    mo.md('\n'.join(_rows))
-    return build_model, evaluate, fold_loaders, train_head
+            va_dl = loader(make_dataset(cache, VAL_IDS[_fold_key]), ui_bs.value, shuffle=False)
+            te_dl = loader(make_dataset(cache, cache.indices_for(RUNS[_fold_key]['test'])), ui_bs.value, shuffle=False)
+            for pct in PCTS:
+                for seed in SEEDS:
+                    ids_used = SUBSETS[subset_key(_fold_key, pct, seed)]
+                    tr_rows = cache.indices_for(ids_used)
+                    tr_dl = loader(make_dataset(cache, tr_rows, augment=True), ui_bs.value, shuffle=True)
+                    for _mode in REGIMES:
+                        torch.manual_seed(seed)
+                        np.random.seed(seed)
+                        _m = build_model(_mode, _fold_key)
+                        val_best, epochs_run = train_with_early_stop(_m, tr_dl, va_dl, ui_max_epochs.value, ui_patience.value)
+                        sc = evaluate(_m, te_dl).scores()
+                        results.append({'fold': _fold_key, 'pct': pct, 'seed': seed, 'regime': _mode, 'n_train': len(tr_rows), 'epochs_run': epochs_run, 'val_mIoU': val_best, 'subset_sig': ','.join(sorted(ids_used))[:64], **{k: sc[k] for k in ('Kappa', 'OA', 'F1', 'mIoU')}})
+                        del _m
+                        if DEVICE == 'cuda':
+                            torch.cuda.empty_cache()
+                        bar_dn.update()
+    with open(WORK / 'results_downstream.json', 'w') as fh:
+        json.dump(results, fh, indent=2)
+    with open(WORK / 'label_subsets.json', 'w') as fh:
+        json.dump(SUBSETS, fh, indent=2)
+    mo.md(f'{len(results)} runs finished, saved to `{WORK}`')
+    return (results,)
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    ## Label-scarcity sweep
+    ### Subset identity check
 
-    The experiment that decides whether the pretraining did anything. At full label
-    count FT and e2e land on top of each other — that is the paper's own result.
-    The separation appears at small training sizes.
+    Verified rather than assumed: for every `(fold, fraction, seed)`, all three
+    regimes must have trained on an identical list of patch IDs.
     """)
     return
 
 
 @app.cell
-def _(mo):
-    ui_sizes = mo.ui.multiselect(["10", "20", "30", "50", "100"],
-                                 value=["10", "30", "100"], label="training sizes")
-    ui_sweep_epochs = mo.ui.slider(5, 100, value=30, step=5, label="epochs per run")
-    run_sweep = mo.ui.run_button(label="④ Run scarcity sweep")
-    mo.vstack([ui_sizes, ui_sweep_epochs, run_sweep])
-    return run_sweep, ui_sizes, ui_sweep_epochs
+def _(FOLDS, PCTS, SEEDS, mo, results, run_dn):
+    mo.stop(not run_dn.value)
+    chk_bad = []
+    for _f in FOLDS:
+        for _p in PCTS:
+            for _sd in SEEDS:
+                sigs = {r['regime']: r['subset_sig'] for r in results if r['fold'] == _f and r['pct'] == _p and (r['seed'] == _sd)}
+                if len(set(sigs.values())) > 1:
+                    chk_bad.append((_f, _p, _sd))
+    chk_nl = chr(10)
+    if chk_bad:
+        mo.md('**MISMATCH** - regimes trained on different subsets:' + chk_nl + chk_nl.join((f'- fold {a}, {b}%, seed {c}' for a, b, c in chk_bad)))
+    else:
+        mo.md(f'All {len(FOLDS) * len(PCTS) * len(SEEDS)} (fold, fraction, seed) groups: every regime trained on an identical label subset.')
+    return
 
 
 @app.cell
-def _(
-    CKPTS,
-    DEVICE,
-    FOLDS,
-    WORK,
-    build_model,
-    evaluate,
-    fold_loaders,
-    json,
-    mo,
-    np,
-    plt,
-    run_sweep,
-    torch,
-    train_head,
-    ui_bs,
-    ui_sizes,
-    ui_sweep_epochs,
-):
-    mo.stop(not run_sweep.value, mo.md('*Press ④. This is sizes × 2 regimes × 2 folds runs.*'))
-    mo.stop(not CKPTS, mo.md('**Pretrain first** — the sweep compares FT against e2e.'))
-    sizes = sorted((int(s) for s in ui_sizes.value))
-    sweep = []
-    with mo.status.progress_bar(total=len(sizes) * len(FOLDS) * 2 * ui_sweep_epochs.value, title='scarcity sweep') as bar_sw:
-        for size in sizes:
-            for _fold_key in FOLDS:
-                _tr_dl, _va_dl, _te_dl, _n_tr, _ = fold_loaders(_fold_key, size, ui_bs.value)
-                for _mode in ['FT', 'e2e']:
-                    torch.manual_seed(_fold_key)
-                    _m = build_model(_mode, _fold_key)
-                    train_head(_m, _tr_dl, _va_dl, ui_sweep_epochs.value, bar=bar_sw)
-                    _sc = evaluate(_m, _te_dl).scores()
-                    sweep.append({'n': _n_tr, 'fold': _fold_key, 'regime': _mode, **{k: _sc[k] for k in ('Kappa', 'OA', 'F1', 'mIoU')}})
-                    del _m
-                    if DEVICE == 'cuda':
-                        torch.cuda.empty_cache()
-    with open(WORK / 'sweep_2fold.json', 'w') as _fh:
-        json.dump(sweep, _fh, indent=2)
-    fig_sw, axs_sw = plt.subplots(1, 4, figsize=(14, 3.2))
-    for ax_s, metric in zip(axs_sw, ['Kappa', 'OA', 'F1', 'mIoU']):
-        for _mode, style in [('FT', '-o'), ('e2e', '--s')]:
-            xs = sorted({r['n'] for r in sweep if r['regime'] == _mode})
-            mu = [float(np.mean([r[metric] for r in sweep if r['regime'] == _mode and r['n'] == x])) for x in xs]
-            sd = [float(np.std([r[metric] for r in sweep if r['regime'] == _mode and r['n'] == x])) for x in xs]
-            if xs:
-                ax_s.errorbar(xs, mu, yerr=sd, fmt=style, capsize=3, ms=4, label=_mode)
-        ax_s.set_xscale('log')
-        ax_s.set_xlabel('training patches')
-        ax_s.set_title(metric)
-        ax_s.grid(alpha=0.3)
-    axs_sw[0].legend(fontsize=8)
-    fig_sw.tight_layout()
-    fig_sw
+def _(FOLDS, PCTS, REGIMES, SEEDS, mo, np, results, run_dn):
+    mo.stop(not run_dn.value)
+    res_nl = chr(10)
+    res_rows = ['| fraction | n | regime | Kappa | OA | F1 | mIoU | epochs |', '|---:|---:|---|---:|---:|---:|---:|---:|']
+    for _p in PCTS:
+        for _mode in REGIMES:
+            sel = [r for r in results if r['pct'] == _p and r['regime'] == _mode]
+            if not sel:
+                continue
+            cellsm = []
+            for _k in ('Kappa', 'OA', 'F1', 'mIoU'):
+                _v = np.array([r[_k] for r in sel])
+                cellsm.append(f'{_v.mean():.4f} +/-{_v.std():.4f}')
+            n_med = int(np.median([r['n_train'] for r in sel]))
+            ep_med = int(np.median([r['epochs_run'] for r in sel]))
+            res_rows.append(f'| {_p}% | {n_med} | {_mode} | ' + ' | '.join(cellsm) + f' | {ep_med} |')
+    mo.md(f'Mean +/- std over {len(SEEDS)} seeds x {len(FOLDS)} folds' + res_nl + res_nl + res_nl.join(res_rows))
+    return
+
+
+@app.cell
+def _(FOLDS, PCTS, REGIMES, SEEDS, VAL_FOLD, mo, np, plt, results, run_dn):
+    mo.stop(not run_dn.value)
+    fig_dn, axs_dn = plt.subplots(1, 4, figsize=(15, 3.4))
+    dn_styles = {'LP': ('-o', '#4c72b0'), 'FT': ('-s', '#dd8452'), 'SL': ('--^', '#55a868')}
+    for ax_d, metric in zip(axs_dn, ['Kappa', 'OA', 'F1', 'mIoU']):
+        for _mode in REGIMES:
+            xs = [p for p in PCTS if any((r['pct'] == p and r['regime'] == _mode for r in results))]
+            mu = [float(np.mean([r[metric] for r in results if r['pct'] == p and r['regime'] == _mode])) for p in xs]
+            _sd = [float(np.std([r[metric] for r in results if r['pct'] == p and r['regime'] == _mode])) for p in xs]
+            fmt, _col = dn_styles.get(_mode, ('-o', None))
+            ax_d.errorbar(xs, mu, yerr=_sd, fmt=fmt, color=_col, capsize=3, ms=4, label=_mode)
+        ax_d.set_xscale('log')
+        ax_d.set_xticks(PCTS, [f'{p}%' for p in PCTS], fontsize=7)
+        ax_d.set_xlabel('label fraction')
+        ax_d.set_title(metric)
+        ax_d.grid(alpha=0.3)
+    axs_dn[0].legend(fontsize=8)
+    fig_dn.suptitle(f'mean +/- std over {len(SEEDS)} seeds x {len(FOLDS)} test folds, early stopping on fold {VAL_FOLD}', fontsize=9)
+    fig_dn.tight_layout()
+    fig_dn
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Reading it
+
+    The gap between **FT** and **SL** at low fractions is the claim under test. If
+    the error bars overlap everywhere, the honest conclusion is that this setup
+    cannot separate them — more seeds narrow the bars, they do not create a gap.
+
+    **LP** below **SL** at high fractions is expected, not a failure: a frozen
+    encoder has far less capacity to fit. The interesting question for a linear
+    probe is how it does at 1–10%, where SL has almost nothing to learn from.
+    """)
     return
 
 
@@ -1629,9 +1739,9 @@ def _(mo):
     ```python
     from huggingface_hub import HfApi
     api = HfApi()
-    api.upload_file(path_or_fileobj=str(WORK / "results_2fold.json"),
-                    path_in_repo="results_2fold.json",
-                    repo_id="<you>/ubarn-pastis", repo_type="model", token="hf_...")
+    for name in ["results_downstream.json", "label_subsets.json"]:
+        api.upload_file(path_or_fileobj=str(WORK / name), path_in_repo=name,
+                        repo_id="<you>/ubarn-pastis", repo_type="model", token="hf_...")
     ```
     """)
     return
