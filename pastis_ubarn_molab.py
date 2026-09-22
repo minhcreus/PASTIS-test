@@ -58,23 +58,48 @@ def _():
     WORK.mkdir(parents=True, exist_ok=True)
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    NUM_WORKERS = max(0, min(2, (os.cpu_count() or 1) - 1))
+
+    # DataLoader workers are OFF by default, and that is deliberate. Every class in
+    # this notebook is defined inside a cell, and a cell-defined class cannot be
+    # pickled -- so any num_workers > 0 dies with "Can't get local object" as soon
+    # as the start method is spawn or forkserver, which is what recent Pythons use.
+    # Loading is not the bottleneck here anyway: one sample is a ~3 MB memmap read
+    # against a GPU step of several hundred ms.
+    # If you do want workers, raise NUM_WORKERS -- a fork context is passed, which
+    # inherits memory instead of pickling. Linux only.
+    import multiprocessing as _mp
+
+    NUM_WORKERS = 0
+    _LOADER_CTX = None
+    if NUM_WORKERS > 0:
+        try:
+            _LOADER_CTX = _mp.get_context("fork")
+        except ValueError:
+            NUM_WORKERS = 0
+            print("fork unavailable on this platform — falling back to 0 workers")
+
+
+    def loader(dataset, batch_size, shuffle, drop_last=False):
+        """One place that builds DataLoaders, so the worker policy stays consistent."""
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                          num_workers=NUM_WORKERS, pin_memory=(DEVICE == "cuda"),
+                          drop_last=drop_last,
+                          multiprocessing_context=_LOADER_CTX if NUM_WORKERS else None)
 
     print("torch  :", torch.__version__)
     print("device :", DEVICE, torch.cuda.get_device_name(0) if DEVICE == "cuda" else "(no GPU — attach one from the notebook specs menu)")
     print("work   :", WORK)
-    print("workers:", NUM_WORKERS)
+    print("workers:", NUM_WORKERS, "(0 = load in the main process)")
     return (
         DEVICE,
-        DataLoader,
         F,
-        NUM_WORKERS,
         Path,
         WORK,
         asdict,
         dataclass,
         datetime,
         json,
+        loader,
         math,
         nn,
         np,
@@ -509,6 +534,7 @@ def _(Manifest, Path, asdict, dataclass, datetime, json, normalize_id, np):
         return train_idx[np.sort(pick)]
 
     return (
+        CLASS_NAMES,
         DataConfig,
         N_BANDS,
         N_CLASSES,
@@ -811,6 +837,76 @@ def _(MAN, folds_to_run, required_ids):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
+    ## EDA — temporal structure
+
+    Straight from the manifest, no download needed. Three things worth knowing
+    before you set `dates per series`:
+
+    - how many acquisitions each patch actually has,
+    - when in the year they fall,
+    - how irregular the revisit is.
+
+    PASTIS is irregularly sampled — that irregularity is the reason the model
+    encodes day-of-year rather than position index.
+    """)
+    return
+
+
+@app.cell
+def _(MAN, datetime, np, plt):
+    eda_dates = {pid: [int(d) for d in rec['dates']] for pid, rec in MAN.patches.items()}
+    eda_counts = np.array([len(v) for v in eda_dates.values()])
+
+    def eda_doy(yyyymmdd):
+        return datetime.strptime(str(yyyymmdd), '%Y%m%d').timetuple().tm_yday
+    eda_all_doy = np.array([eda_doy(d) for v in eda_dates.values() for d in v])
+    eda_in_window = np.array([sum((1 for d in v if 20190101 <= d <= 20191130)) for v in eda_dates.values()])
+    eda_gaps = []
+    for _v in eda_dates.values():
+        ds = sorted((datetime.strptime(str(d), '%Y%m%d') for d in _v if 20190101 <= d <= 20191130))
+        eda_gaps.extend(((ds[i + 1] - ds[i]).days for i in range(len(ds) - 1)))
+    eda_gaps = np.array(eda_gaps)
+    fig_eda1, ax_eda1 = plt.subplots(1, 3, figsize=(14, 3.4))
+    ax_eda1[0].hist(eda_counts, bins=range(eda_counts.min(), eda_counts.max() + 2), color='#4c72b0', edgecolor='white')
+    ax_eda1[0].hist(eda_in_window, bins=range(eda_counts.min(), eda_counts.max() + 2), color='#dd8452', edgecolor='white', alpha=0.85)
+    ax_eda1[0].set_title('acquisitions per patch')
+    ax_eda1[0].set_xlabel('dates')
+    ax_eda1[0].legend(['full series', 'Jan–Nov 2019 window'], fontsize=7)
+    ax_eda1[1].hist(eda_all_doy, bins=36, color='#55a868', edgecolor='white')
+    ax_eda1[1].set_title('when acquisitions fall')
+    ax_eda1[1].set_xlabel('day of year')
+    ax_eda1[2].hist(eda_gaps, bins=range(0, min(eda_gaps.max(), 60) + 3, 2), color='#c44e52', edgecolor='white')
+    ax_eda1[2].axvline(5, ls='--', c='k', lw=1)
+    ax_eda1[2].set_title('gap between consecutive dates')
+    ax_eda1[2].set_xlabel('days   (dashed = 5-day nominal revisit)')
+    for _a in ax_eda1:
+        _a.grid(alpha=0.25)
+    fig_eda1.tight_layout()
+    fig_eda1
+    return eda_counts, eda_gaps, eda_in_window
+
+
+@app.cell
+def _(eda_counts, eda_gaps, eda_in_window, mo, np, ui_tmax):
+    eda_lines = [
+        f"acquisitions per patch : min {eda_counts.min()}  median {int(np.median(eda_counts))}  max {eda_counts.max()}",
+        f"inside Jan-Nov 2019    : min {eda_in_window.min()}  median {int(np.median(eda_in_window))}  max {eda_in_window.max()}",
+        f"revisit gap (days)     : median {int(np.median(eda_gaps))}  p90 {int(np.percentile(eda_gaps, 90))}  max {eda_gaps.max()}",
+        "",
+        f"your setting: dates per series = {ui_tmax.value}",
+    ]
+    if ui_tmax.value >= int(np.median(eda_in_window)):
+        eda_lines.append("-> keeps essentially the whole in-window series; thinning is a no-op for most patches")
+    else:
+        eda_lines.append(f"-> thins the median patch from {int(np.median(eda_in_window))} to {ui_tmax.value} dates, evenly spaced")
+    eda_nl = chr(10)
+    mo.md("```" + eda_nl + eda_nl.join(eda_lines) + eda_nl + "```")
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
     ## Data
 
     `SUBSET` caps how many patches are fetched — the full set is ~34 GB and molab's
@@ -887,23 +983,231 @@ def _(
 @app.cell
 def _(VOID_CLASS, cache, mo, np, plt, run_cache):
     mo.stop(not run_cache.value)
-
-    pi, ti = 0, min(10, cache.x.shape[1] - 1)
+    pi, ti = (0, min(10, cache.x.shape[1] - 1))
     xv = cache.denormalize(np.asarray(cache.x[pi, ti], dtype=np.float32))
     rgb_img = np.stack([xv[2], xv[1], xv[0]], -1)
-    rgb_img = np.clip(rgb_img / max(np.percentile(rgb_img, 98), 1e-6), 0, 1)
+    rgb_img = np.clip(rgb_img / max(np.percentile(rgb_img, 98), 1e-06), 0, 1)
     yv = cache.target[pi].astype(float)
     yv[yv == VOID_CLASS] = np.nan
-
     fig_prev, ax_prev = plt.subplots(1, 2, figsize=(8, 4))
     ax_prev[0].imshow(rgb_img)
-    ax_prev[0].set_title(f"patch {cache.ids[pi]} · DOY {cache.doy[pi, ti]}")
-    ax_prev[1].imshow(yv, cmap="tab20", vmin=0, vmax=19, interpolation="nearest")
-    ax_prev[1].set_title(f"labels · fold {cache.folds[pi]}")
-    for a in ax_prev:
-        a.axis("off")
+    ax_prev[0].set_title(f'patch {cache.ids[pi]} · DOY {cache.doy[pi, ti]}')
+    ax_prev[1].imshow(yv, cmap='tab20', vmin=0, vmax=19, interpolation='nearest')
+    ax_prev[1].set_title(f'labels · fold {cache.folds[pi]}')
+    for _a in ax_prev:
+        _a.axis('off')
     fig_prev.tight_layout()
     fig_prev
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Are the folds comparable?
+
+    The 2-fold average is only meaningful if the two test partitions look alike.
+    This counts labelled pixels per class **per official fold**, so you can see
+    whether a crop that exists in fold 5 is missing from fold 1.
+    """)
+    return
+
+
+@app.cell
+def _(CLASS_NAMES, N_CLASSES, cache, mo, np, plt, run_cache):
+    mo.stop(not run_cache.value, mo.md('*Cached data needed — press ① first.*'))
+    eda_fold_counts = {}
+    for fold_id in sorted(set(cache.folds.tolist())):
+        _rows = np.flatnonzero(cache.folds == fold_id)
+        tally = np.zeros(N_CLASSES, dtype=np.int64)
+        for _r in _rows:
+            tally += np.bincount(cache.target[_r].reshape(-1), minlength=N_CLASSES)
+        eda_fold_counts[int(fold_id)] = tally
+    eda_crop_ids = [c for c in range(1, 19) if any((t[c] > 0 for t in eda_fold_counts.values()))]
+    eda_mat = np.array([[eda_fold_counts[f][c] for c in eda_crop_ids] for f in sorted(eda_fold_counts)], dtype=float)
+    eda_share = eda_mat / np.maximum(eda_mat.sum(1, keepdims=True), 1)
+    fig_eda2, ax_eda2 = plt.subplots(figsize=(11, 3.2))
+    im_eda = ax_eda2.imshow(eda_share, cmap='viridis', aspect='auto')
+    ax_eda2.set_yticks(range(len(eda_fold_counts)), [f'fold {f}' for f in sorted(eda_fold_counts)])
+    ax_eda2.set_xticks(range(len(eda_crop_ids)), [CLASS_NAMES[c] for c in eda_crop_ids], rotation=90, fontsize=7)
+    ax_eda2.set_title('share of labelled crop pixels, by fold')
+    fig_eda2.colorbar(im_eda, fraction=0.025)
+    fig_eda2.tight_layout()
+    fig_eda2
+    return eda_crop_ids, eda_fold_counts
+
+
+@app.cell
+def _(CLASS_NAMES, cache, eda_crop_ids, eda_fold_counts, mo, run_cache):
+    mo.stop(not run_cache.value)
+    eda_missing = {f: [CLASS_NAMES[c] for c in eda_crop_ids if eda_fold_counts[f][c] == 0] for f in sorted(eda_fold_counts)}
+    eda_rows = ['| fold | patches | labelled px | background | void | classes present | absent |', '|---|---:|---:|---:|---:|---:|---|']
+    for f in sorted(eda_fold_counts):
+        _t = eda_fold_counts[f]
+        tot = _t.sum()
+        _lab = _t[1:19].sum()
+        present = int((_t[1:19] > 0).sum())
+        eda_rows.append(f'| {f} | {int((cache.folds == f).sum())} | {_lab:,} | {100 * _t[0] / max(tot, 1):.1f}% | {100 * _t[19] / max(tot, 1):.1f}% | {present}/18 | {', '.join(eda_missing[f]) or '—'} |')
+    mo.md(chr(10).join(eda_rows))
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Temporal signatures and cloud
+
+    The premise of the whole method is that crops separate *in time*, not in a
+    single image. This plots mean NDVI against day of year per crop class, from
+    **training folds only**.
+
+    If the curves overlap completely, no amount of pretraining will help and the
+    problem is upstream — wrong date window, too few dates, or a normalisation
+    bug. Well-separated curves mean the signal is there.
+
+    The cloud panel matters because PASTIS ships no cloud masks and roughly 28% of
+    its images are partly cloudy. High blue-band reflectance is a decent proxy.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    run_eda = mo.ui.run_button(label="Run spectral / temporal EDA (sampled)")
+    run_eda
+    return (run_eda,)
+
+
+@app.cell
+def _(
+    CLASS_NAMES,
+    FOLDS,
+    N_CLASSES,
+    RUNS,
+    VOID_CLASS,
+    cache,
+    mo,
+    np,
+    plt,
+    run_cache,
+    run_eda,
+):
+    mo.stop(not run_cache.value, mo.md('*Press ① first.*'))
+    mo.stop(not run_eda.value, mo.md('*Press the button above — samples ~60 training patches.*'))
+    eda_train_ids = sorted(set(RUNS[FOLDS[0]]['train']))
+    # training rows only, so nothing here is informed by val or test
+    eda_rows_tr = cache.indices_for(eda_train_ids)
+    eda_sample = eda_rows_tr[:60] if len(eda_rows_tr) > 60 else eda_rows_tr
+    EDA_BIN = 10
+    eda_nbins = 366 // EDA_BIN + 1
+    eda_sum = np.zeros((N_CLASSES, eda_nbins))
+    eda_cnt = np.zeros((N_CLASSES, eda_nbins))
+    eda_blue, eda_brightness = ([], [])
+    with mo.status.progress_bar(total=len(eda_sample), title='sampling') as bar_eda:
+        for _r in eda_sample:
+            arr = cache.denormalize(np.asarray(cache.x[_r], dtype=np.float32))
+            valid_t = cache.valid[_r]
+            doys = cache.doy[_r]
+            red, nir, blue = (arr[:, 2], arr[:, 6], arr[:, 0])  # (T,C,H,W)
+            ndvi = (nir - red) / np.maximum(nir + red, 1e-06)
+            tgt = cache.target[_r]
+            for _t in range(arr.shape[0]):
+                if not valid_t[_t]:
+                    continue
+                _b = int(doys[_t]) // EDA_BIN
+                eda_blue.append(float(blue[_t].mean()))
+                eda_brightness.append(float(arr[_t].mean()))
+                for c in np.unique(tgt):
+                    if c == 0 or c == VOID_CLASS:
+                        continue
+                    _m = tgt == c
+                    eda_sum[c, _b] += float(ndvi[_t][_m].mean())
+                    eda_cnt[c, _b] += 1
+            bar_eda.update()
+    eda_blue = np.array(eda_blue)
+    eda_brightness = np.array(eda_brightness)
+    eda_prof = np.where(eda_cnt > 0, eda_sum / np.maximum(eda_cnt, 1), np.nan)
+    eda_top = sorted([c for c in range(1, 19) if np.isfinite(eda_prof[c]).sum() > 3], key=lambda c: -np.isfinite(eda_prof[c]).sum())[:8]
+    fig_eda3, ax_eda3 = plt.subplots(1, 2, figsize=(13, 3.8))
+    xs_eda = np.arange(eda_nbins) * EDA_BIN
+    for c in eda_top:
+        ax_eda3[0].plot(xs_eda, eda_prof[c], lw=1.6, label=CLASS_NAMES[c])
+    ax_eda3[0].set_xlabel('day of year')
+    ax_eda3[0].set_ylabel('mean NDVI')
+    ax_eda3[0].set_title('temporal signature by crop (training folds)')
+    ax_eda3[0].legend(fontsize=6, ncol=2)
+    ax_eda3[0].grid(alpha=0.25)
+    eda_thr = float(np.percentile(eda_blue, 90))
+    ax_eda3[1].hist(eda_blue, bins=50, color='#4c72b0', edgecolor='white')
+    ax_eda3[1].axvline(eda_thr, ls='--', c='crimson', lw=1.2)
+    ax_eda3[1].set_xlabel('mean blue reflectance per date')
+    ax_eda3[1].set_title(f'cloud proxy — {100 * (eda_blue > eda_thr).mean():.0f}% of dates above p90')
+    ax_eda3[1].grid(alpha=0.25)
+    fig_eda3.tight_layout()
+    fig_eda3
+    return eda_rows_tr, eda_sample
+
+
+@app.cell
+def _(N_BANDS, cache, eda_sample, mo, np, run_cache, run_eda):
+    mo.stop(not run_cache.value)
+    mo.stop(not run_eda.value)
+    eda_norm_sample = np.asarray(cache.x[eda_sample[:12]], dtype=np.float32)
+    # does the robust scaler actually centre the data?
+    eda_band_rows = ['| band | p05 | median | p95 | after scaling: median | IQR |', '|---|---:|---:|---:|---:|---:|']
+    EDA_BAND_NAMES = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12']
+    for _b in range(N_BANDS):
+        _v = eda_norm_sample[:, :, _b].reshape(-1)
+        _v = _v[np.isfinite(_v)]
+        eda_band_rows.append(f'| {EDA_BAND_NAMES[_b]} | {cache.stats['q05'][_b]:.0f} | {cache.stats['median'][_b]:.0f} | {cache.stats['q95'][_b]:.0f} | {np.median(_v):+.3f} | {np.percentile(_v, 75) - np.percentile(_v, 25):.3f} |')
+    eda_nl3 = chr(10)
+    mo.md('**Band statistics.** Scaled medians should sit near 0. A band far off means its stats were estimated from too few patches.' + eda_nl3 + eda_nl3 + eda_nl3.join(eda_band_rows))
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Patch gallery
+
+    Six training patches at one date, with their labels. Mostly a check that the
+    crop, the band order and the label alignment are all what you expect.
+    """)
+    return
+
+
+@app.cell
+def _(
+    FOLDS,
+    RUNS,
+    VOID_CLASS,
+    cache,
+    eda_rows_tr,
+    mo,
+    np,
+    plt,
+    run_cache,
+    run_eda,
+):
+    mo.stop(not run_cache.value)
+    eda_gal = eda_rows_tr[:6] if run_eda.value else cache.indices_for(sorted(set(RUNS[FOLDS[0]]['train'])))[:6]
+    eda_gal = eda_gal[:6]
+    fig_eda4, ax_eda4 = plt.subplots(2, len(eda_gal), figsize=(2.1 * len(eda_gal), 4.6), squeeze=False)
+    for _col, _r in enumerate(eda_gal):
+        _t = min(10, cache.x.shape[1] - 1)
+        _a = cache.denormalize(np.asarray(cache.x[_r, _t], dtype=np.float32))
+        img = np.stack([_a[2], _a[1], _a[0]], -1)
+        img = np.clip(img / max(np.percentile(img, 98), 1e-06), 0, 1)
+        _lab = cache.target[_r].astype(float)
+        _lab[_lab == VOID_CLASS] = np.nan
+        ax_eda4[0][_col].imshow(img)
+        ax_eda4[0][_col].set_title(f'{cache.ids[_r]} · f{cache.folds[_r]}', fontsize=7)
+        ax_eda4[1][_col].imshow(_lab, cmap='tab20', vmin=0, vmax=19, interpolation='nearest')
+        ax_eda4[0][_col].axis('off')
+        ax_eda4[1][_col].axis('off')
+    fig_eda4.suptitle('training patches — RGB and labels', fontsize=9)
+    fig_eda4.tight_layout()
+    fig_eda4
     return
 
 
@@ -942,16 +1246,15 @@ def _(mo):
 @app.cell
 def _(
     DEVICE,
-    DataLoader,
     FOLDS,
     LinearDecoder,
     MAN,
-    NUM_WORKERS,
     N_BANDS,
     RUNS,
     UBARN,
     WORK,
     cache,
+    loader,
     make_dataset,
     mo,
     permutation_mask,
@@ -971,7 +1274,7 @@ def _(
         assert not {cache.ids[i] for i in idx} & held, 'leak'
         if len(idx) == 0:
             raise RuntimeError(f'fold {fold_key}: no cached training patches')
-        dl = DataLoader(make_dataset(cache, idx, augment=True), batch_size=ui_bs.value, shuffle=True, num_workers=NUM_WORKERS, pin_memory=DEVICE == 'cuda', drop_last=len(idx) > ui_bs.value)
+        dl = loader(make_dataset(cache, idx, augment=True), ui_bs.value, shuffle=True, drop_last=len(idx) > ui_bs.value)
         torch.manual_seed(0)
         enc = UBARN(in_ch=N_BANDS, d_model=64, d_hidden=128, n_layers=3, n_heads=4).to(DEVICE)
         dec = LinearDecoder(64, N_BANDS).to(DEVICE)
@@ -1054,15 +1357,14 @@ def _(
     ui_mask,
 ):
     mo.stop(not run_pre.value)
-
-    # reconstruction on a HELD-OUT patch, so this is a real check not memorisation
     viz_fold = FOLDS[-1]
+    # reconstruction on a HELD-OUT patch, so this is a real check not memorisation
     enc_v, dec_v = VIZ[viz_fold]
-    enc_v.eval(); dec_v.eval()
-    held_ids = sorted(set(RUNS[viz_fold]["val"]) | set(RUNS[viz_fold]["test"]))
+    enc_v.eval()
+    dec_v.eval()
+    held_ids = sorted(set(RUNS[viz_fold]['val']) | set(RUNS[viz_fold]['test']))
     held_rows = cache.indices_for(held_ids)
     vi = int(held_rows[0]) if len(held_rows) else 0
-
     xv1 = torch.from_numpy(np.asarray(cache.x[vi], dtype=np.float32))[None].to(DEVICE)
     dv1 = torch.from_numpy(cache.doy[vi].astype(np.float32))[None].to(DEVICE)
     vv1 = torch.from_numpy(cache.valid[vi].copy())[None].to(DEVICE)
@@ -1074,18 +1376,16 @@ def _(
     def to_rgb(arr4):
         a = cache.denormalize(arr4)
         img = np.stack([a[2], a[1], a[0]], -1)
-        return np.clip(img / max(np.percentile(img, 98), 1e-6), 0, 1)
-
+        return np.clip(img / max(np.percentile(img, 98), 1e-06), 0, 1)
     picks = torch.nonzero(mv[0]).flatten().cpu().numpy()[:6]
-    fig_rec, ax_rec = plt.subplots(2, len(picks), figsize=(2.1 * len(picks), 4.4),
-                                   squeeze=False)
-    for col, tt in enumerate(picks):
-        ax_rec[0][col].imshow(to_rgb(xv1[0, tt].cpu().numpy()))
-        ax_rec[0][col].set_title(f"DOY {cache.doy[vi, tt]}", fontsize=8)
-        ax_rec[1][col].imshow(to_rgb(rv[0, tt].float().cpu().numpy()))
-        ax_rec[0][col].axis("off"); ax_rec[1][col].axis("off")
-    fig_rec.suptitle(f"held-out patch {cache.ids[vi]} (fold {viz_fold}) — "
-                     f"top: masked input · bottom: reconstruction", fontsize=9)
+    fig_rec, ax_rec = plt.subplots(2, len(picks), figsize=(2.1 * len(picks), 4.4), squeeze=False)
+    for _col, tt in enumerate(picks):
+        ax_rec[0][_col].imshow(to_rgb(xv1[0, tt].cpu().numpy()))
+        ax_rec[0][_col].set_title(f'DOY {cache.doy[vi, tt]}', fontsize=8)
+        ax_rec[1][_col].imshow(to_rgb(rv[0, tt].float().cpu().numpy()))
+        ax_rec[0][_col].axis('off')
+        ax_rec[1][_col].axis('off')
+    fig_rec.suptitle(f'held-out patch {cache.ids[vi]} (fold {viz_fold}) — top: masked input · bottom: reconstruction', fontsize=9)
     fig_rec.tight_layout()
     fig_rec
     return
@@ -1123,9 +1423,7 @@ def _(
     CKPTS,
     ConfusionMeter,
     DEVICE,
-    DataLoader,
     FOLDS,
-    NUM_WORKERS,
     N_BANDS,
     N_CLASSES,
     RUNS,
@@ -1135,6 +1433,7 @@ def _(
     WORK,
     cache,
     json,
+    loader,
     make_dataset,
     mo,
     np,
@@ -1160,7 +1459,7 @@ def _(
         te = cache.indices_for(sp['test'])
         if n_train is not None:
             tr = scarce_subset(cache, tr, n_train)
-        mk = lambda idx, shuf, aug: DataLoader(make_dataset(cache, idx, augment=aug), batch_size=batch_size, shuffle=shuf, num_workers=NUM_WORKERS, pin_memory=DEVICE == 'cuda')
+        mk = lambda idx, shuf, aug: loader(make_dataset(cache, idx, augment=aug), batch_size, shuffle=shuf)
         return (mk(tr, True, True), mk(va, False, False), mk(te, False, False), len(tr), len(te))
 
     @torch.no_grad()
@@ -1221,22 +1520,22 @@ def _(
                     torch.cuda.empty_cache()
     with open(WORK / 'results_2fold.json', 'w') as _fh:
         json.dump(results, _fh, indent=2)
-    rows = ['| fold | regime | train | test | Kappa | OA | F1 | mIoU |', '|---|---|---:|---:|---:|---:|---:|---:|']
-    for r in results:
-        rows.append(f'| {r['fold']} | {r['regime']} | {r['n_train']} | {r['n_test']} | {r['Kappa']:.4f} | {r['OA']:.4f} | {r['F1']:.4f} | {r['mIoU']:.4f} |')
-    rows.append('')
-    rows.append('**Mean across folds**')
-    rows.append('')
-    rows.append('| regime | Kappa | OA | F1 | mIoU |')
-    rows.append('|---|---:|---:|---:|---:|')
+    _rows = ['| fold | regime | train | test | Kappa | OA | F1 | mIoU |', '|---|---|---:|---:|---:|---:|---:|---:|']
+    for _r in results:
+        _rows.append(f'| {_r['fold']} | {_r['regime']} | {_r['n_train']} | {_r['n_test']} | {_r['Kappa']:.4f} | {_r['OA']:.4f} | {_r['F1']:.4f} | {_r['mIoU']:.4f} |')
+    _rows.append('')
+    _rows.append('**Mean across folds**')
+    _rows.append('')
+    _rows.append('| regime | Kappa | OA | F1 | mIoU |')
+    _rows.append('|---|---:|---:|---:|---:|')
     for _mode in REGIMES:
         sel = [r for r in results if r['regime'] == _mode]
         cellsm = []
         for _k in ('Kappa', 'OA', 'F1', 'mIoU'):
-            v = np.array([r[_k] for r in sel])
-            cellsm.append(f'{v.mean():.4f} ±{v.std():.4f}')
-        rows.append(f'| {_mode} | ' + ' | '.join(cellsm) + ' |')
-    mo.md('\n'.join(rows))
+            _v = np.array([r[_k] for r in sel])
+            cellsm.append(f'{_v.mean():.4f} ±{_v.std():.4f}')
+        _rows.append(f'| {_mode} | ' + ' | '.join(cellsm) + ' |')
+    mo.md('\n'.join(_rows))
     return build_model, evaluate, fold_loaders, train_head
 
 
