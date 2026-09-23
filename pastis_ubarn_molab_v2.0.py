@@ -14,10 +14,7 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # U-BARN on PASTIS · v2.0
-
-    Masked pretraining of a Unet + transformer on Sentinel-2 time series, evaluated
-    on PASTIS crop segmentation. Dumeur, Valero & Inglada, JSTARS 17 (2024).
+    # U-BARN on PASTIS · v2.1
 
     Self-contained: no imports, no uploads. Run top to bottom.
     """)
@@ -26,7 +23,7 @@ def _(mo):
 
 @app.cell
 def _():
-    VERSION = "2.0"
+    VERSION = "2.1"
 
     import copy, json, math, os, sys, urllib.request
     from dataclasses import dataclass, asdict
@@ -114,6 +111,7 @@ def _():
         math,
         nn,
         np,
+        os,
         plt,
         torch,
         urllib,
@@ -330,30 +328,67 @@ def _(Manifest, Path, asdict, dataclass, datetime, json, normalize_id, np):
                 return c
         return None
 
-    def _hf_prefix() -> str:
+    def _is_rate_limit(err) -> bool:
+        msg = str(err)
+        return '429' in msg or 'Too Many Requests' in msg or 'rate limit' in msg.lower()
+
+    def _with_backoff(fn, retries=8, base_wait=30, log=print, what='request'):
+        """Retry fn() on HTTP 429 with exponential backoff; re-raise anything else."""
+        import time
+        for attempt in range(retries):
+            try:
+                return fn()
+            except Exception as err:
+                if not _is_rate_limit(err) or attempt == retries - 1:
+                    raise
+                wait = min(600, base_wait * 2 ** attempt)
+                log(f'rate limited on {what}; waiting {wait}s (attempt {attempt + 1}/{retries})')
+                time.sleep(wait)
+
+    def _hf_prefix(token=None, log=print) -> str:
         from huggingface_hub import list_repo_files
-        for f in list_repo_files(HF_REPO, repo_type='dataset'):
+        files = _with_backoff(lambda: list_repo_files(HF_REPO, repo_type='dataset', token=token), log=log, what='file listing')
+        for f in files:
             if 'DATA_S2/' in f:
                 return f.split('DATA_S2/')[0]
         raise FileNotFoundError(f'DATA_S2 not found in {HF_REPO}')
 
-    def download_patches(ids, cache_dir: Path, workers: int=8) -> Path:
-        """Fetch S2 series and annotations for the given IDs."""
+    def download_patches(ids, cache_dir: Path, workers: int=4, token=None, batch: int=400, base_wait: int=30, log=print, progress=None) -> Path:
+        """Fetch S2 series and annotations for the given IDs.
+
+        In batches, with backoff on HTTP 429. Files already in the cache are not
+        refetched, so an interrupted download resumes where it stopped. Xet
+        transfers are disabled: each file otherwise costs an extra API call for a
+        read token, which is what exhausts the anonymous rate limit.
+        """
+        import os
+        os.environ['HF_HUB_DISABLE_XET'] = '1'
+        try:
+            import huggingface_hub.constants as hf_const
+            hf_const.HF_HUB_DISABLE_XET = True
+        except Exception:
+            pass
         from huggingface_hub import snapshot_download
-        prefix = _hf_prefix()
-        patterns = []
-        for pid in ids:
-            patterns.append(f'{prefix}DATA_S2/S2_{pid}.npy')
-            patterns.append(f'{prefix}ANNOTATIONS/TARGET_{pid}.npy')
-        local = snapshot_download(HF_REPO, repo_type='dataset', allow_patterns=patterns, cache_dir=str(cache_dir / 'hf'), max_workers=workers)
+        ids = list(ids)
+        prefix = _hf_prefix(token, log)
+        local = None
+        for i in range(0, len(ids), batch):
+            chunk = ids[i:i + batch]
+            patterns = []
+            for pid in chunk:
+                patterns.append(f'{prefix}DATA_S2/S2_{pid}.npy')
+                patterns.append(f'{prefix}ANNOTATIONS/TARGET_{pid}.npy')
+            local = _with_backoff(lambda: snapshot_download(HF_REPO, repo_type='dataset', allow_patterns=patterns, cache_dir=str(cache_dir / 'hf'), max_workers=workers, token=token), base_wait=base_wait, log=log, what=f'batch {i // batch + 1}/{-(-len(ids) // batch)}')
+            if progress is not None:
+                progress(len(chunk))
         return Path(local) / prefix if prefix else Path(local)
 
-    def resolve_source(ids, cache_dir: Path, local_hint: str | None=None):
+    def resolve_source(ids, cache_dir: Path, local_hint: str | None=None, token=None, log=print, progress=None):
         """(raw_root, description): local copy if present, else download."""
         local = find_local_pastis(local_hint)
         if local is not None:
             return (local, f'local copy at {local}')
-        return (download_patches(ids, cache_dir), 'Hugging Face mirror')
+        return (download_patches(ids, cache_dir, token=token, log=log, progress=progress), 'Hugging Face mirror')
 
     def _doy(yyyymmdd: str) -> int:
         return datetime.strptime(str(yyyymmdd), '%Y%m%d').timetuple().tm_yday
@@ -391,12 +426,12 @@ def _(Manifest, Path, asdict, dataclass, datetime, json, normalize_id, np):
         return stats
 
     def normalize(arr: np.ndarray, stats: dict) -> np.ndarray:
-    # preprocessing
         q05 = np.asarray(stats['q05'], dtype=np.float32)[None, :, None, None]
         q95 = np.asarray(stats['q95'], dtype=np.float32)[None, :, None, None]
         med = np.asarray(stats['median'], dtype=np.float32)[None, :, None, None]
         x = np.clip(arr.astype(np.float32), q05, q95)
         return (x - med) / np.maximum(q95 - q05, 1e-06)
+    # preprocessing
 
     def build_cache(raw_root: Path, manifest: Manifest, ids, cfg: DataConfig, out_dir: Path, norm_ids=None, progress=None) -> Path:
         """Preprocess IDs into one memmap + sidecar arrays."""
@@ -495,12 +530,12 @@ def _(Manifest, Path, asdict, dataclass, datetime, json, normalize_id, np):
             def __getitem__(self, i):
                 j = int(self.idx[i])
                 if ps < full:
-    # cache handle
                     if random_crop:
                         r0, c0 = np.random.randint(0, full - ps + 1, size=2)
                     else:
                         r0 = c0 = (full - ps) // 2
                     x = np.asarray(cache.x[j, ..., r0:r0 + ps, c0:c0 + ps], dtype=np.float32)
+    # cache handle
                     y = np.asarray(cache.target[j, r0:r0 + ps, c0:c0 + ps], dtype=np.int64)
                 else:
                     x = np.asarray(cache.x[j], dtype=np.float32)
@@ -1054,11 +1089,14 @@ def _(PRESETS, mo, ui_preset):
                                value=P["window"], label="date window")
     ui_rcrop = mo.ui.checkbox(P["random_crop"], label="random crop in training (paper)")
     ui_flips = mo.ui.checkbox(P["flips"], label="flips + rot90 augmentation")
-    mo.vstack([ui_subset, ui_tmax, ui_crop, ui_patch, ui_window, ui_rcrop, ui_flips])
+    ui_hf_token = mo.ui.text(kind="password", label="Hugging Face token (optional; avoids rate limits)",
+                             full_width=True)
+    mo.vstack([ui_subset, ui_tmax, ui_crop, ui_patch, ui_window, ui_rcrop, ui_flips, ui_hf_token])
     return (
         P,
         ui_crop,
         ui_flips,
+        ui_hf_token,
         ui_patch,
         ui_rcrop,
         ui_subset,
@@ -1127,15 +1165,22 @@ def _(
     build_cache,
     cfg,
     mo,
+    os,
     resolve_source,
     run_cache,
+    ui_hf_token,
 ):
     CACHE_TAG = WORK / 'cache' / f'{cfg.tag()}_n{len(USE_IDS)}'
     CACHE_READY = (CACHE_TAG / 'manifest.json').exists()
     mo.stop(not run_cache.value and (not CACHE_READY), mo.md('*Press ① to fetch and preprocess.*'))
     # button-or-on-disk: run_button resets to False, so gating on it alone would
     # wipe `cache` on any upstream change
-    RAW_ROOT, source_note = (CACHE_TAG, 'cache already on disk') if CACHE_READY else resolve_source(USE_IDS, WORK)
+    HF_TOKEN = ui_hf_token.value.strip() or os.environ.get('HF_TOKEN') or None
+    if CACHE_READY:
+        RAW_ROOT, source_note = (CACHE_TAG, 'cache already on disk')
+    else:
+        with mo.status.progress_bar(total=len(USE_IDS), title='downloading patches', subtitle='authenticated' if HF_TOKEN else 'anonymous') as bar_dl:
+            RAW_ROOT, source_note = resolve_source(USE_IDS, WORK, token=HF_TOKEN, log=lambda m: bar_dl.update(increment=0, subtitle=m), progress=lambda k: bar_dl.update(increment=k))
     norm_ids = [i for i in RUNS[FOLDS[0]]['train'] if i in set(USE_IDS)]
     with mo.status.progress_bar(total=len(USE_IDS), title='preprocessing') as bar_cache:
         CACHE_DIR = build_cache(RAW_ROOT, MAN, USE_IDS, cfg, WORK / 'cache', norm_ids=norm_ids, progress=bar_cache.update)
