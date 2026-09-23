@@ -14,7 +14,10 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # U-BARN on PASTIS · v2.1
+    # U-BARN on PASTIS · v2.3
+
+    Masked pretraining of a Unet + transformer on Sentinel-2 time series, evaluated
+    on PASTIS crop segmentation. Dumeur, Valero & Inglada, JSTARS 17 (2024).
 
     Self-contained: no imports, no uploads. Run top to bottom.
     """)
@@ -23,7 +26,7 @@ def _(mo):
 
 @app.cell
 def _():
-    VERSION = "2.1"
+    VERSION = "2.3"
 
     import copy, json, math, os, sys, urllib.request
     from dataclasses import dataclass, asdict
@@ -666,22 +669,22 @@ def _(F, math, nn, torch):
             layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=d_hidden, dropout=dropout, activation='relu', batch_first=True, norm_first=False)
             self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers, enable_nested_tensor=False)
 
-        def embed(self, x: torch.Tensor, doy: torch.Tensor, valid=None) -> torch.Tensor:
+        def embed(self, x: torch.Tensor, doy: torch.Tensor, valid=None, vidx=None) -> torch.Tensor:
             """(B,T,C,H,W) -> (B,T,d,H,W) with positional encoding.
 
-            Padded dates are never passed through the SSE, so BatchNorm statistics and
-            results do not depend on how much padding a batch carries.
+            Padded dates never pass through the SSE. Pass `vidx` (flat indices of
+            valid frames, built on the host) to do this without a device sync.
             """
             b, t, c, h, w = x.shape
             flat = x.reshape(b * t, c, h, w)
-            if valid is None:
+            if vidx is None and valid is not None:
+                vidx = torch.nonzero(valid.reshape(-1)).squeeze(1)
+            if vidx is None:
+    # backbone
                 f = self.sse(flat)
             else:
-    # backbone
-                v = valid.reshape(-1)
-                enc_v = self.sse(flat[v])
-                f = enc_v.new_zeros(b * t, self.d_model, h, w)
-                f[v] = enc_v
+                enc_v = self.sse(flat.index_select(0, vidx))
+                f = enc_v.new_zeros(b * t, self.d_model, h, w).index_copy(0, vidx, enc_v)
             f = f.reshape(b, t, self.d_model, h, w)
             pe = doy_encoding(doy, self.d_model)
             return f + pe[:, :, :, None, None]
@@ -695,8 +698,8 @@ def _(F, math, nn, torch):
             out = torch.nan_to_num(out)
             return out.reshape(b, h, w, t, d).permute(0, 3, 4, 1, 2)
 
-        def forward(self, x, doy, valid):
-            return self.temporal(self.embed(x, doy, valid), valid)
+        def forward(self, x, doy, valid, vidx=None):
+            return self.temporal(self.embed(x, doy, valid, vidx), valid)
 
     def permutation_mask(f: torch.Tensor, valid: torch.Tensor, rate: float, generator: torch.Generator | None=None):
         """Corrupt a fraction of dates by permuting embedded values within the batch.
@@ -790,12 +793,12 @@ def _(F, math, nn, torch):
                 self.encoder.eval()
             return self
 
-        def forward(self, x, doy, valid):
+        def forward(self, x, doy, valid, vidx=None):
             if self.freeze:
                 with torch.no_grad():
-                    f = self.encoder(x, doy, valid)
+                    f = self.encoder(x, doy, valid, vidx)
             else:
-                f = self.encoder(x, doy, valid)
+                f = self.encoder(x, doy, valid, vidx)
             return self.head(f, valid)
 
     class ConfusionMeter:
@@ -811,24 +814,26 @@ def _(F, math, nn, torch):
         def update(self, pred: torch.Tensor, target: torch.Tensor):
             pred = pred.flatten()
             target = target.flatten().to(pred.device)
-            keep = torch.ones_like(target, dtype=torch.bool)
+            nn2 = self.n * self.n
+            idx = target * self.n + pred
             if self.ignore is not None:
-                keep &= target != self.ignore
-            idx = target[keep] * self.n + pred[keep]
-            cm = torch.bincount(idx, minlength=self.n * self.n).reshape(self.n, self.n)
+                idx = torch.where(target == self.ignore, torch.full_like(idx, nn2), idx)
+            cm = torch.zeros(nn2 + 1, dtype=torch.long, device=pred.device)
+            cm.scatter_add_(0, idx, torch.ones_like(idx))
+            cm = cm[:nn2].reshape(self.n, self.n)
             if self.cm.device != cm.device:
                 self.cm = self.cm.to(cm.device)
             self.cm += cm
 
         @staticmethod
-        def _metrics(cm, cls):
-            """Macro metrics over classes `cls`; rows outside `cls` are dropped entirely,
-            so pixels of other classes neither count nor penalise."""  # master query (N, d)
-            cm = cm.clone()  # (N, T, d)
+        def _metrics(cm, cls):  # master query (N, d)
+            """Macro metrics over classes `cls`; rows outside `cls` are dropped entirely,  # (N, T, d)
+            so pixels of other classes neither count nor penalise."""
+            cm = cm.clone()
             keep_rows = torch.zeros(cm.shape[0], dtype=torch.bool)
-            keep_rows[cls] = True
+            keep_rows[cls] = True  # (N, d)
             cm[~keep_rows] = 0
-            total = cm.sum().clamp(min=1)  # (N, d)
+            total = cm.sum().clamp(min=1)
             tp = cm.diag()
             oa = (tp[cls].sum() / total).item()
             row, col = (cm.sum(1), cm.sum(0))
@@ -860,9 +865,9 @@ def _(F, math, nn, torch):
             crop_cls = [c for c in all_cls if c != 0]
             a = self._metrics(cm, all_cls)
             c = self._metrics(cm, crop_cls)
+    # metrics
             out = dict(a)
             out['F1'] = a['mF1']
-    # metrics
             out.update({f'{k}_crop': v for k, v in c.items() if not k.startswith('per_class')})
             out['per_class_iou_crop'] = c['per_class_iou']
             out['per_class_f1_crop'] = c['per_class_f1']
@@ -871,41 +876,41 @@ def _(F, math, nn, torch):
     def spatiotemporal_mask(f, valid, t_rate, s_rate=0.0, block=8, generator=None):
         """Temporal masking (paper) plus optional spatial block masking on the remaining dates.
 
+        Each sample gets round(t_rate * n_valid) masked dates (at least one), drawn
+        uniformly among its valid dates. Masked positions are overwritten with
+        values drawn from anywhere in the batch's feature tensor. No host syncs.
+
         Returns (corrupted_features, pixel_mask (B,T,H,W) bool).
         """
         b, t, d, h, w = f.shape
         device = f.device
-        date_mask = torch.zeros(b, t, dtype=torch.bool, device=device)
-        for i in range(b):
-            idx = torch.nonzero(valid[i], as_tuple=False).flatten()
-            if idx.numel() == 0:
-                continue
-            k = max(1, int(round(t_rate * idx.numel())))
-            perm = torch.randperm(idx.numel(), device=device, generator=generator)
-            date_mask[i, idx[perm[:k]]] = True
-        px = date_mask[:, :, None, None].expand(b, t, h, w).clone()
+        n_valid = valid.sum(1)
+        k = torch.clamp(torch.round(t_rate * n_valid.float()), min=1).long()
+        k = torch.minimum(k, n_valid)
+        score = torch.rand(b, t, device=device, generator=generator)
+        score = score.masked_fill(~valid, 2.0)
+        rank = score.argsort(1).argsort(1)
+        date_mask = (rank < k[:, None]) & valid
+        px = date_mask[:, :, None, None].expand(b, t, h, w)
         if s_rate > 0:
             gh, gw = (-(-h // block), -(-w // block))
             blocks = torch.rand(b, t, gh, gw, device=device, generator=generator) < s_rate
             blocks &= valid[:, :, None, None] & ~date_mask[:, :, None, None]
             blk = blocks.repeat_interleave(block, 2).repeat_interleave(block, 3)[:, :, :h, :w]
-            px |= blk
-        n = int(px.sum().item())
-        if n == 0:
-            return (f, px)
-        flat = f.reshape(-1)
-        draw = torch.randint(0, flat.numel(), (n, d), device=device, generator=generator)
-        out = f.permute(0, 1, 3, 4, 2).clone()
-        out[px] = flat[draw]
-        return (out.permute(0, 1, 4, 2, 3).contiguous(), px)
+            px = px | blk
+        vec = f.permute(0, 1, 3, 4, 2).reshape(-1, d)
+        src = torch.randint(0, vec.shape[0], (b * t * h * w,), device=device, generator=generator)
+        shift = int(torch.randint(0, d, (1,), generator=None).item())
+        repl = vec.index_select(0, src).roll(shift, dims=1)
+        repl = repl.reshape(b, t, h, w, d).permute(0, 1, 4, 2, 3)
+        out = torch.where(px[:, :, None], repl, f)
+        return (out, px)
 
     def masked_pixel_loss(pred, target, px):
         """MSE over masked pixels. Equals reconstruction_loss when px is a whole-date mask."""
-        if px.sum() == 0:
-            return pred.sum() * 0.0
-        p = pred.permute(0, 1, 3, 4, 2)[px]
-        q = target.permute(0, 1, 3, 4, 2)[px]
-        return F.mse_loss(p, q)
+        m = px[:, :, None].to(pred.dtype)
+        se = ((pred - target) ** 2 * m).sum()
+        return se / (m.sum() * pred.shape[2]).clamp(min=1.0)
 
     def dice_loss(logits, target, ignore_index, n_classes):
         """Soft multiclass Dice over classes present in the batch."""
@@ -916,10 +921,9 @@ def _(F, math, nn, torch):
         prob = prob * keep[:, None]
         inter = (prob * oh).sum((0, 2, 3))
         denom = prob.sum((0, 2, 3)) + oh.sum((0, 2, 3))
-        present = oh.sum((0, 2, 3)) > 0
-        if present.sum() == 0:
-            return logits.sum() * 0.0
-        return 1.0 - ((2 * inter + 1.0) / (denom + 1.0))[present].mean()
+        present = (oh.sum((0, 2, 3)) > 0).to(prob.dtype)
+        dice = (2 * inter + 1.0) / (denom + 1.0)
+        return 1.0 - (dice * present).sum() / present.sum().clamp(min=1.0)  # padded dates rank last  # source value for each position: a random pixel of a random date anywhere in  # the batch, with a random cyclic shift along the feature axis (paper III-B1:  # another date, another pixel, or another feature)  # CPU draw, no device sync
 
     return (
         ConfusionMeter,
@@ -1062,7 +1066,17 @@ def _(mo):
             max_epochs=300, lp_epochs=300, min_epochs=100, patience=20, val_cap=0,
             lr="1e-3", lp_lr="1e-3", warm=0, dn_bs=2, min_steps=0, lr_scale=False,
             ft_mode="plain", lpft=0, enc_mult="1", loss="CE", cw=False, ls="0",
-            ema=False, tta=False, fnorm=False, opt="adam"),
+            ema=False, tta=False, fnorm=False, opt="adam", val_every=5, lr_ref_bs=2,
+            pre_lr_scale=False),
+        "paper · batch 16": dict(
+            patches=2433, t_max=48, cache_crop="128", patch="64",
+            window="Jan-Nov 2019 (paper)", random_crop=True, flips=False,
+            mask=0.6, smask=0.0, pre_epochs=100, pre_lr="1e-3", pre_bs=16, pre_opt="adam+plateau",
+            max_epochs=300, lp_epochs=300, min_epochs=100, patience=20, val_cap=150,
+            lr="1e-3", lp_lr="1e-3", warm=0, dn_bs=16, min_steps=0, lr_scale=True,
+            ft_mode="plain", lpft=0, enc_mult="1", loss="CE", cw=False, ls="0",
+            ema=False, tta=False, fnorm=False, opt="adam", val_every=5, lr_ref_bs=2,
+            pre_lr_scale=True),
         "improved": dict(
             patches=2433, t_max=48, cache_crop="128", patch="64",
             window="full series (Sep 2018-Nov 2019)", random_crop=True, flips=True,
@@ -1070,7 +1084,8 @@ def _(mo):
             max_epochs=150, lp_epochs=150, min_epochs=0, patience=10, val_cap=150,
             lr="1e-3", lp_lr="1e-2", warm=3, dn_bs=16, min_steps=20, lr_scale=True,
             ft_mode="LP-FT", lpft=10, enc_mult="0.1", loss="CE + Dice", cw=True, ls="0.05",
-            ema=True, tta=True, fnorm=True, opt="adamw"),
+            ema=True, tta=True, fnorm=True, opt="adamw", val_every=1, lr_ref_bs=4,
+            pre_lr_scale=True),
     }
     ui_preset = mo.ui.dropdown(list(PRESETS), value="paper (Dumeur et al. 2024)",
                                label="configuration")
@@ -1207,14 +1222,15 @@ def _(
     torch,
 ):
     class GpuLoader:
-        """Batches straight from a GPU-resident copy of the cache; augmentation on GPU."""
+        """Batches from a GPU-resident cache with no host syncs: indices and crop
+        offsets stay on the CPU, and valid-frame indices are built from a CPU copy."""
 
         def __init__(self, store, rows, batch_size, shuffle, augment, drop_last=False, min_steps=0, patch=None, random_crop=False, flips=True):
             self.s, self.bs, self.shuffle, self.augment = (store, batch_size, shuffle, augment)
             self.full = store['x'].shape[-1]
             self.ps = patch or self.full
             self.random_crop, self.flips = (random_crop, flips)
-            self.rows = torch.as_tensor(np.asarray(rows, dtype=np.int64), device=store['dev'])
+            self.rows = np.asarray(rows, dtype=np.int64)
             self.drop_last = drop_last and len(self.rows) > batch_size
             n = len(self.rows)
             base = n // batch_size if self.drop_last else -(-n // batch_size)
@@ -1225,28 +1241,29 @@ def _(
             return self.steps
 
         def __iter__(self):
-            n = len(self.rows)
+            n, dev = (len(self.rows), self.s['dev'])
             if self.repeat:
                 need = self.steps * self.bs
-                perm = torch.cat([torch.randperm(n) for _ in range(-(-need // n))])[:need]
-                rows = self.rows[perm.to(self.rows.device)]
+                perm = torch.cat([torch.randperm(n) for _ in range(-(-need // n))])[:need].numpy()
+                rows = self.rows[perm]
             elif self.shuffle:
-                rows = self.rows[torch.randperm(n).to(self.rows.device)]
+                rows = self.rows[torch.randperm(n).numpy()]
             else:
                 rows = self.rows
             for i in range(len(self)):
-                j = rows[i * self.bs:(i + 1) * self.bs]
+                j = rows[i * self.bs:(i + 1) * self.bs].tolist()
                 if self.ps < self.full:
                     m = self.full - self.ps
                     if self.random_crop:
-                        offs = torch.randint(0, m + 1, (len(j), 2))
+                        offs = torch.randint(0, m + 1, (len(j), 2)).tolist()
                     else:
-                        offs = torch.full((len(j), 2), m // 2)
-                    x = torch.stack([self.s['x'][jj, ..., r:r + self.ps, c:c + self.ps] for jj, (r, c) in zip(j, offs.tolist())]).float()
-                    y = torch.stack([self.s['y'][jj, r:r + self.ps, c:c + self.ps] for jj, (r, c) in zip(j, offs.tolist())])
+                        offs = [(m // 2, m // 2)] * len(j)
+                    x = torch.stack([self.s['x'][jj, ..., r:r + self.ps, c:c + self.ps] for jj, (r, c) in zip(j, offs)]).float()
+                    y = torch.stack([self.s['y'][jj, r:r + self.ps, c:c + self.ps] for jj, (r, c) in zip(j, offs)])
                 else:
-                    x = self.s['x'][j].float()
-                    y = self.s['y'][j].clone()
+                    jt = torch.as_tensor(j).pin_memory().to(dev, non_blocking=True) if dev == 'cuda' else torch.as_tensor(j)
+                    x = self.s['x'][jt].float()
+                    y = self.s['y'][jt].clone()
                 if self.augment and self.flips:
                     for k in range(x.shape[0]):
                         if torch.rand(1).item() < 0.5:
@@ -1257,7 +1274,10 @@ def _(
                         if r:
                             x[k] = torch.rot90(x[k], r, (-2, -1))
                             y[k] = torch.rot90(y[k], r, (-2, -1))
-                yield {'x': x, 'doy': self.s['doy'][j], 'valid': self.s['valid'][j], 'y': y}
+                v_cpu = self.s['valid_cpu'][j]
+                vidx = torch.nonzero(v_cpu.reshape(-1)).squeeze(1).pin_memory().to(dev, non_blocking=True) if dev == 'cuda' else torch.nonzero(v_cpu.reshape(-1)).squeeze(1)
+                jt = torch.as_tensor(j).pin_memory().to(dev, non_blocking=True) if dev == 'cuda' else torch.as_tensor(j)
+                yield {'x': x, 'doy': self.s['doy'][jt], 'valid': self.s['valid'][jt], 'y': y, 'vidx': vidx}
     GPU_STORE = None
     gpu_note = 'data path: CPU DataLoader'
     if DEVICE == 'cuda':
@@ -1267,7 +1287,7 @@ def _(
             _xs = torch.empty(cache.x.shape, dtype=torch.float16, device=DEVICE)
             for i0 in range(0, len(cache), 64):
                 _xs[i0:i0 + 64] = torch.from_numpy(np.asarray(cache.x[i0:i0 + 64])).to(DEVICE)
-            GPU_STORE = {'dev': DEVICE, 'x': _xs, 'doy': torch.from_numpy(cache.doy.astype(np.float32)).to(DEVICE), 'valid': torch.from_numpy(cache.valid.copy()).to(DEVICE), 'y': torch.from_numpy(cache.target.astype(np.int64)).to(DEVICE)}
+            GPU_STORE = {'dev': DEVICE, 'x': _xs, 'doy': torch.from_numpy(cache.doy.astype(np.float32)).to(DEVICE), 'valid': torch.from_numpy(cache.valid.copy()).to(DEVICE), 'valid_cpu': torch.from_numpy(cache.valid.copy()), 'y': torch.from_numpy(cache.target.astype(np.int64)).to(DEVICE)}
             gpu_note = f'data path: GPU-resident ({need_b / 1000000000.0:.1f} GB of {total_b / 1000000000.0:.0f} GB)'
         else:
             gpu_note = f'data path: CPU DataLoader (cache {need_b / 1000000000.0:.1f} GB exceeds 50% of {total_b / 1000000000.0:.0f} GB)'
@@ -1534,6 +1554,7 @@ def _(
     LinearDecoder,
     MAN,
     N_BANDS,
+    P,
     PATCH,
     RANDOM_CROP,
     RUNS,
@@ -1579,8 +1600,9 @@ def _(
         n_ep = ui_pre_epochs.value
         paper_opt = ui_pre_opt.value == 'adam+plateau'
         if paper_opt:
-            opt = torch.optim.Adam(prm, lr=float(ui_pre_lr.value), fused=FUSED)  # fold 4 images, labels unused: selects the checkpoint, as the paper's
-            sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=10, factor=0.5)  # held-out unlabelled validation set does
+            pre_scale = (ui_bs.value / P['lr_ref_bs']) ** 0.5 if P['pre_lr_scale'] else 1.0  # fold 4 images, labels unused: selects the checkpoint, as the paper's
+            opt = torch.optim.Adam(prm, lr=float(ui_pre_lr.value) * pre_scale, fused=FUSED)  # held-out unlabelled validation set does
+            sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=10, factor=0.5)
         else:
             opt = torch.optim.AdamW(prm, lr=float(ui_pre_lr.value) * (ui_bs.value / 4) ** 0.5, weight_decay=0.0001, fused=FUSED)
             warm = max(1, n_ep // 20)
@@ -1589,6 +1611,7 @@ def _(
         out = ckpt_path(fold_key).parent
         out.mkdir(parents=True, exist_ok=True)
         hist, vhist = ([], [])
+        last_v, best_v = (None, None)
 
         @torch.no_grad()
         def val_loss():
@@ -1601,7 +1624,7 @@ def _(
                 doy = b['doy'].to(DEVICE)
                 valid = b['valid'].to(DEVICE)
                 with torch.amp.autocast('cuda', dtype=AMP_DTYPE, enabled=DEVICE == 'cuda'):
-                    feats = enc.embed(x, doy, valid)
+                    feats = enc.embed(x, doy, valid, b.get('vidx'))
                     corrupt, pxm = spatiotemporal_mask(feats, valid, ui_mask.value, ui_smask.value, int(ui_sblock.value), generator=g)
                     rec = dec(enc.temporal(corrupt, valid))
                     tot_v = tot_v + masked_pixel_loss(rec.float(), x, pxm)
@@ -1616,7 +1639,7 @@ def _(
                 doy = b['doy'].to(DEVICE, non_blocking=True)
                 valid = b['valid'].to(DEVICE, non_blocking=True)
                 with torch.amp.autocast('cuda', dtype=AMP_DTYPE, enabled=DEVICE == 'cuda'):
-                    feats = enc.embed(x, doy, valid)
+                    feats = enc.embed(x, doy, valid, b.get('vidx'))
                     corrupt, pxm = spatiotemporal_mask(feats, valid, ui_mask.value, ui_smask.value, int(ui_sblock.value))
                     rec = dec(enc.temporal(corrupt, valid))
                     loss = masked_pixel_loss(rec.float(), x, pxm)
@@ -1630,18 +1653,25 @@ def _(
                 tot = tot + loss.detach()
                 nb += 1
             ep_loss = float(tot) / max(nb, 1)
-            v_loss = val_loss() if len(va_idx) else ep_loss
+            if len(va_idx):
+                pre_eval = (ep + 1) % P['val_every'] == 0 or ep + 1 == n_ep
+                if pre_eval:
+                    last_v = val_loss()
+            else:
+                pre_eval, last_v = (True, ep_loss)
             hist.append(ep_loss)
-            vhist.append(v_loss)
+            vhist.append(last_v if last_v is not None else float('nan'))
             if paper_opt:
-                sch.step(v_loss)
+                if last_v is not None:
+                    sch.step(last_v)
             else:
                 sch.step()
-            if v_loss <= min(vhist):
-                torch.save({'encoder': enc.state_dict(), 'decoder': dec.state_dict(), 'loss': v_loss, 'train_loss': ep_loss, 'epoch': ep, 'history': list(hist), 'val_history': list(vhist), 'mask_rate': ui_mask.value, 'spatial_mask': ui_smask.value, 'spatial_block': int(ui_sblock.value), 'fold': fold_key, 'optimizer': ui_pre_opt.value, 'split_manifest_sha256': MAN.sha256, 'pretrain_ids': sorted(pool)}, out / 'best.pt')
-            yield (fold_key, ep, v_loss, out / 'best.pt', hist, enc, dec)
+            if pre_eval and (best_v is None or last_v <= best_v):
+                best_v = last_v
+                torch.save({'encoder': enc.state_dict(), 'decoder': dec.state_dict(), 'loss': best_v, 'train_loss': ep_loss, 'epoch': ep, 'history': list(hist), 'val_history': list(vhist), 'mask_rate': ui_mask.value, 'spatial_mask': ui_smask.value, 'spatial_block': int(ui_sblock.value), 'fold': fold_key, 'optimizer': ui_pre_opt.value, 'split_manifest_sha256': MAN.sha256, 'pretrain_ids': sorted(pool)}, out / 'best.pt')
+            yield (fold_key, ep, last_v, out / 'best.pt', hist, enc, dec)
     CKPTS, HISTORIES, VIZ = ({}, {}, {})
-    todo = [f for f in FOLDS if not ckpt_path(f).exists()]
+    todo = [f for f in FOLDS if not ckpt_path(f).exists()]  # no val set: select on train loss
     total_steps = max(1, len(todo) * ui_pre_epochs.value)
     with mo.status.progress_bar(total=total_steps, title='pretraining') as bar_pre:
         for fk in FOLDS:
@@ -1754,11 +1784,14 @@ def _(P, mo, ui_preset):
     ui_min_epochs = mo.ui.slider(0, 200, value=P["min_epochs"], step=10,
                                  label="min epochs before early stopping (paper: 100)")
     ui_patience = mo.ui.slider(3, 50, value=P["patience"], step=1, label="early-stop patience")
+    ui_val_every = mo.ui.slider(1, 10, value=P["val_every"], step=1,
+                                label="validate every N epochs until the minimum")
     ui_val_cap = mo.ui.slider(0, 500, value=P["val_cap"], step=50,
                               label="val patches (0 = all of fold 4)")
     ui_lr = mo.ui.dropdown(["3e-4", "1e-3", "3e-3"], value=P["lr"], label="lr (FT / SL)")
     ui_lp_lr = mo.ui.dropdown(["1e-3", "3e-3", "1e-2"], value=P["lp_lr"], label="lr (LP)")
     ui_opt = mo.ui.dropdown(["adam", "adamw"], value=P["opt"], label="optimiser")
+    ui_sync_debug = mo.ui.checkbox(False, label="warn on GPU host syncs (diagnostic, one run)")
     ui_save_w = mo.ui.dropdown(["off", "best seed per (fold, regime, fraction)", "all runs"],
                                value="best seed per (fold, regime, fraction)",
                                label="save downstream weights")
@@ -1769,7 +1802,8 @@ def _(P, mo, ui_preset):
     ui_enc_mult = mo.ui.dropdown(["1", "0.3", "0.1"], value=P["enc_mult"], label="FT encoder lr x")
     ui_warm = mo.ui.slider(0, 10, value=P["warm"], step=1, label="warmup epochs")
     ui_dn_bs = mo.ui.slider(1, 64, value=P["dn_bs"], step=1, label="downstream batch size")
-    ui_lr_scale = mo.ui.checkbox(P["lr_scale"], label="scale lr by sqrt(batch / 4)")
+    ui_lr_scale = mo.ui.checkbox(P["lr_scale"],
+                                 label=f"scale lr by sqrt(batch / {P['lr_ref_bs']})")
     ui_min_steps = mo.ui.slider(0, 50, value=P["min_steps"], step=5,
                                 label="min steps per epoch (0 = one pass)")
     ui_loss = mo.ui.dropdown(["CE", "CE + Dice"], value=P["loss"], label="loss")
@@ -1779,7 +1813,7 @@ def _(P, mo, ui_preset):
     mo.vstack([
         mo.md(f"**Preset: {ui_preset.value}**"),
         mo.md("**Protocol**"),
-        ui_pcts, ui_nseeds, ui_min_epochs, ui_patience, ui_val_cap,
+        ui_pcts, ui_nseeds, ui_min_epochs, ui_patience, ui_val_every, ui_val_cap,
         mo.md("**Optimisation**"),
         ui_max_epochs, ui_lp_epochs, ui_lr, ui_lp_lr, ui_opt, ui_warm,
         ui_dn_bs, ui_lr_scale, ui_min_steps,
@@ -1788,7 +1822,7 @@ def _(P, mo, ui_preset):
         mo.md("**Shared by all regimes**"),
         ui_loss, ui_cw, ui_ls, ui_ema, ui_tta, ui_fnorm,
         mo.md("**Output**"),
-        ui_save_w,
+        ui_save_w, ui_sync_debug,
     ])
     return (
         ui_cw,
@@ -1812,8 +1846,10 @@ def _(P, mo, ui_preset):
         ui_patience,
         ui_pcts,
         ui_save_w,
+        ui_sync_debug,
         ui_tta,
         ui_val_cap,
+        ui_val_every,
         ui_warm,
     )
 
@@ -1873,6 +1909,7 @@ def _(
     FOLDS,
     GPU_STORE,
     N_RUNS,
+    P,
     PATCH,
     PCTS,
     RANDOM_CROP,
@@ -1910,10 +1947,11 @@ def _(
     ui_save_w,
     ui_tta,
     ui_val_cap,
+    ui_val_every,
     ui_warm,
 ):
     RESULTS_FILE = WORK / 'results_downstream.json'
-    RUN_SIG = {'version': VERSION, 'folds': FOLDS, 'val_fold': VAL_FOLD, 'pcts': PCTS, 'seeds': SEEDS, 'regimes': REGIMES, 'max_epochs': ui_max_epochs.value, 'lp_epochs': ui_lp_epochs.value, 'patience': ui_patience.value, 'val_cap': ui_val_cap.value, 'lr': ui_lr.value, 'lp_lr': ui_lp_lr.value, 'class_balanced': ui_cw.value, 'feat_norm': ui_fnorm.value, 'save_weights': ui_save_w.value, 'ft_mode': ui_ft_mode.value, 'lpft_epochs': ui_lpft_epochs.value, 'enc_mult': ui_enc_mult.value, 'warmup': ui_warm.value, 'loss': ui_loss.value, 'label_smoothing': ui_ls.value, 'ema': ui_ema.value, 'tta': ui_tta.value, 'data_path': 'gpu' if GPU_STORE is not None else 'cpu', 'dn_bs': ui_dn_bs.value, 'min_steps': ui_min_steps.value, 'min_epochs': ui_min_epochs.value, 'optimizer': ui_opt.value, 'lr_scale': ui_lr_scale.value, 'preset': ui_preset.value, 'patch': PATCH, 'random_crop': RANDOM_CROP, 'flips': FLIPS, 'amp': str(AMP_DTYPE), 'cache': str(CACHE_DIR), 'ckpts': {str(k): str(v) for k, v in CKPTS.items()}}
+    RUN_SIG = {'version': VERSION, 'folds': FOLDS, 'val_fold': VAL_FOLD, 'pcts': PCTS, 'seeds': SEEDS, 'regimes': REGIMES, 'max_epochs': ui_max_epochs.value, 'lp_epochs': ui_lp_epochs.value, 'patience': ui_patience.value, 'val_cap': ui_val_cap.value, 'lr': ui_lr.value, 'lp_lr': ui_lp_lr.value, 'class_balanced': ui_cw.value, 'feat_norm': ui_fnorm.value, 'save_weights': ui_save_w.value, 'ft_mode': ui_ft_mode.value, 'lpft_epochs': ui_lpft_epochs.value, 'enc_mult': ui_enc_mult.value, 'warmup': ui_warm.value, 'loss': ui_loss.value, 'label_smoothing': ui_ls.value, 'ema': ui_ema.value, 'tta': ui_tta.value, 'data_path': 'gpu' if GPU_STORE is not None else 'cpu', 'dn_bs': ui_dn_bs.value, 'min_steps': ui_min_steps.value, 'min_epochs': ui_min_epochs.value, 'optimizer': ui_opt.value, 'val_every': ui_val_every.value, 'lr_ref_bs': P['lr_ref_bs'], 'lr_scale': ui_lr_scale.value, 'preset': ui_preset.value, 'patch': PATCH, 'random_crop': RANDOM_CROP, 'flips': FLIPS, 'amp': str(AMP_DTYPE), 'cache': str(CACHE_DIR), 'ckpts': {str(k): str(v) for k, v in CKPTS.items()}}
     PRIOR_RUNS = []
     if RESULTS_FILE.exists():
         with open(RESULTS_FILE) as fh_prev:
@@ -1976,6 +2014,7 @@ def _(
     N_BANDS,
     N_CLASSES,
     N_RUNS,
+    P,
     PCTS,
     PRIOR_RUNS,
     REGIMES,
@@ -2018,7 +2057,9 @@ def _(
     ui_opt,
     ui_patience,
     ui_save_w,
+    ui_sync_debug,
     ui_tta,
+    ui_val_every,
     ui_warm,
 ):
     def build_model(mode, fold_key):
@@ -2038,14 +2079,14 @@ def _(
         return torch.tensor(w, dtype=torch.float32)
 
     @torch.no_grad()
-    def predict(model, x, doy, valid, tta=False):
+    def predict(model, x, doy, valid, tta=False, vidx=None):
         if not tta:
-            return model(x, doy, valid).float().softmax(1)
+            return model(x, doy, valid, vidx).float().softmax(1)
         acc = 0
         for flip in (False, True):
             xf = x.flip(-1) if flip else x
             for k in range(4):
-                pr = model(torch.rot90(xf, k, dims=(-2, -1)), doy, valid).float().softmax(1)
+                pr = model(torch.rot90(xf, k, dims=(-2, -1)), doy, valid, vidx).float().softmax(1)
                 pr = torch.rot90(pr, -k, dims=(-2, -1))
                 acc = acc + (pr.flip(-1) if flip else pr)
         return acc / 8
@@ -2056,7 +2097,7 @@ def _(
         meter = ConfusionMeter(N_CLASSES, ignore_index=VOID_CLASS)
         for b in dl:
             with torch.amp.autocast('cuda', dtype=AMP_DTYPE, enabled=DEVICE == 'cuda'):
-                pr = predict(model, b['x'].to(DEVICE), b['doy'].to(DEVICE), b['valid'].to(DEVICE), tta)
+                pr = predict(model, b['x'].to(DEVICE), b['doy'].to(DEVICE), b['valid'].to(DEVICE), tta, b.get('vidx'))
             meter.update(pr.argmax(1), b['y'])
         return meter
 
@@ -2097,7 +2138,8 @@ def _(
         ema_model = copy.deepcopy(model) if ema else None
         warm = min(ui_warm.value, max(epochs - 1, 0))
         prm = head_p + enc_p
-        best, best_state, stale, ran = (-1.0, None, 0, 0)
+        best, best_state, ran = (-1.0, None, 0)
+        last_val, last_improve = (None, 0)
         for ep in range(epochs):
             if ep < warm:
                 for g, b0 in zip(opt.param_groups, base_lr):
@@ -2106,7 +2148,7 @@ def _(
             for b in tr_dl:
                 yb = b['y'].to(DEVICE)
                 with torch.amp.autocast('cuda', dtype=AMP_DTYPE, enabled=DEVICE == 'cuda'):
-                    lg = model(b['x'].to(DEVICE), b['doy'].to(DEVICE), b['valid'].to(DEVICE))
+                    lg = model(b['x'].to(DEVICE), b['doy'].to(DEVICE), b['valid'].to(DEVICE), b.get('vidx'))
                 loss = ce(lg.float(), yb)
                 if use_dice:
                     loss = loss + dice_loss(lg, yb, VOID_CLASS, N_CLASSES)
@@ -2120,21 +2162,21 @@ def _(
                 if ema:
                     ema.update(model)
             ran = ep + 1
-            target = model
-            if ema:
-                ema_model.load_state_dict(ema.shadow)
-                target = ema_model
-            val_miou = evaluate(target, va_dl).scores()['mIoU']
-            if ep >= warm:
-                sch.step(val_miou)
-            if val_miou > best + 1e-05:
-                best, stale = (val_miou, 0)
-                best_state = {k: v.detach().cpu().clone() for k, v in target.state_dict().items()}
-            elif early_stop and ep >= warm:
-                stale += 1
-                if stale >= patience and ep + 1 >= ui_min_epochs.value:
-                    break
-        if best_state:
+            do_eval = ran % ui_val_every.value == 0 or ran >= ui_min_epochs.value or ran == epochs
+            if do_eval:
+                target = model
+                if ema:
+                    ema_model.load_state_dict(ema.shadow)
+                    target = ema_model
+                last_val = evaluate(target, va_dl).scores()['mIoU']
+                if last_val > best + 1e-05:
+                    best, last_improve = (last_val, ran)
+                    best_state = {k: v.detach().cpu().clone() for k, v in target.state_dict().items()}
+            if ep >= warm and last_val is not None:
+                sch.step(last_val)
+            if early_stop and do_eval and (ep >= warm) and (ran >= ui_min_epochs.value) and (ran - last_improve >= patience):
+                break  # before the minimum epoch count early stopping cannot fire, so
+        if best_state:  # validation there only picks the best checkpoint: every val_every epochs
             model.load_state_dict(best_state)
         return (best, ran)
 
@@ -2147,7 +2189,7 @@ def _(
             for prm_e in m.encoder.parameters():
                 prm_e.requires_grad_(False)
             m.freeze = True
-            _, r1 = fit(m, tr_dl, va_dl, ui_lpft_epochs.value, ui_patience.value, float(ui_lp_lr.value) * lr_scale, 1.0, weight, early_stop=False)
+            _, r1 = fit(m, tr_dl, va_dl, ui_lpft_epochs.value, ui_patience.value, float(ui_lp_lr.value) * lr_scale, 1.0, weight, early_stop=False)  # stepping every epoch with the latest value keeps plateau patience in epochs
             for prm_e in m.encoder.parameters():
                 prm_e.requires_grad_(True)
             m.freeze = False
@@ -2205,12 +2247,18 @@ def _(
                     tr_rows = cache.indices_for(ids_used)
                     weight = class_weights(tr_rows) if ui_cw.value else None
                     bs_eff = min(ui_dn_bs.value, len(tr_rows))
-                    lr_scale = (bs_eff / 4) ** 0.5 if ui_lr_scale.value else 1.0
+                    lr_scale = (bs_eff / P['lr_ref_bs']) ** 0.5 if ui_lr_scale.value else 1.0
                     tr_dl = make_loader(tr_rows, bs_eff, shuffle=True, augment=True, min_steps=ui_min_steps.value)
                     for _mode in pending:
                         torch.manual_seed(seed)
                         np.random.seed(seed)
-                        _m, val_best, epochs_run = train_run(_mode, _fold_key, tr_dl, va_dl, weight, lr_scale)
+                        if DEVICE == 'cuda' and ui_sync_debug.value:
+                            torch.cuda.set_sync_debug_mode('warn')
+                        try:
+                            _m, val_best, epochs_run = train_run(_mode, _fold_key, tr_dl, va_dl, weight, lr_scale)
+                        finally:
+                            if DEVICE == 'cuda':
+                                torch.cuda.set_sync_debug_mode('default')
                         sc = evaluate(_m, te_dl, tta=ui_tta.value).scores()
                         wpath = save_run_weights(_m, _fold_key, pct, seed, _mode, sc['mIoU'], {k: sc[k] for k in ('OA', 'mIoU', 'mF1', 'Kappa')})
                         results.append({'weights': wpath, 'fold': _fold_key, 'pct': pct, 'seed': seed, 'regime': _mode, 'n_train': len(tr_rows), 'epochs_run': epochs_run, 'val_mIoU': val_best, 'subset_sig': ','.join(sorted(ids_used))[:64], 'OA': sc['OA'], 'mIoU': sc['mIoU'], 'mF1': sc['mF1'], 'Kappa': sc['Kappa'], 'OA_crop': sc['OA_crop'], 'mIoU_crop': sc['mIoU_crop'], 'mF1_crop': sc['mF1_crop'], 'Kappa_crop': sc['Kappa_crop'], 'per_class_iou': sc['per_class_iou'], 'per_class_f1': sc['per_class_f1'], 'per_class_iou_crop': sc['per_class_iou_crop'], 'per_class_f1_crop': sc['per_class_f1_crop']})
@@ -2222,7 +2270,55 @@ def _(
     with open(WORK / 'label_subsets.json', 'w') as fh:
         json.dump(SUBSETS, fh, indent=2)
     mo.md(f'{len(results)}/{N_RUNS} runs' + (' (loaded from disk)' if DN_READY else ''))
-    return WEIGHT_DIR, results
+    return WEIGHT_DIR, results, run_key
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Results from other sessions
+
+    Run one test fold per session, download `results_downstream.json` each time,
+    then add the earlier files here. Everything below uses the combined set.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    ui_merge = mo.ui.file(filetypes=[".json"], multiple=True, kind="area",
+                          label="drop results_downstream.json files from other sessions")
+    ui_merge
+    return (ui_merge,)
+
+
+@app.cell
+def _(RUN_SIG, json, mo, results, run_key, ui_merge):
+    MERGE_IGNORE = {'folds', 'cache', 'ckpts', 'data_path', 'amp'}
+    ALL_RESULTS = list(results)
+    merge_seen = {run_key(r) for r in ALL_RESULTS}
+    merge_notes = []
+    for up in ui_merge.value:
+        try:
+            doc_m = json.loads(up.contents)
+        except Exception as err_m:
+            merge_notes.append(f'- {up.name}: not readable ({err_m})')
+            continue
+        sig_m = doc_m.get('signature', {})
+        diff_m = sorted((k for k in set(sig_m) | set(RUN_SIG) if k not in MERGE_IGNORE and sig_m.get(k) != RUN_SIG.get(k)))
+        if diff_m:
+            merge_notes.append(f'- {up.name}: **skipped**, settings differ in {', '.join(diff_m)}')
+            continue
+        added_m = 0
+        for _r in doc_m.get('runs', []):
+            if run_key(_r) not in merge_seen:
+                ALL_RESULTS.append(_r)
+                merge_seen.add(run_key(_r))
+                added_m += 1
+        merge_notes.append(f'- {up.name}: added {added_m} runs, folds {sorted({r['fold'] for r in doc_m.get('runs', [])})}')
+    ALL_FOLDS = sorted({r['fold'] for r in ALL_RESULTS})
+    mo.md(f'**{len(ALL_RESULTS)} runs** across test folds {ALL_FOLDS}' + (chr(10) + chr(10) + chr(10).join(merge_notes) if merge_notes else ''))
+    return ALL_FOLDS, ALL_RESULTS
 
 
 @app.cell(hide_code=True)
@@ -2234,19 +2330,19 @@ def _(mo):
 
 
 @app.cell
-def _(FOLDS, PCTS, SEEDS, mo, results):
+def _(ALL_FOLDS, ALL_RESULTS, PCTS, SEEDS, mo):
     chk_bad = []
-    for _f in FOLDS:
+    for _f in ALL_FOLDS:
         for _p in PCTS:
             for _sd in SEEDS:
-                sigs = {r['regime']: r['subset_sig'] for r in results if r['fold'] == _f and r['pct'] == _p and (r['seed'] == _sd)}
+                sigs = {r['regime']: r['subset_sig'] for r in ALL_RESULTS if r['fold'] == _f and r['pct'] == _p and (r['seed'] == _sd)}
                 if len(set(sigs.values())) > 1:
                     chk_bad.append((_f, _p, _sd))
     chk_nl = chr(10)
     if chk_bad:
         mo.md('**MISMATCH:**' + chk_nl + chk_nl.join((f'- fold {a}, {b}%, seed {c}' for a, b, c in chk_bad)))
     else:
-        mo.md(f'All {len(FOLDS) * len(PCTS) * len(SEEDS)} groups: identical subsets across regimes.')
+        mo.md(f'All {len(ALL_FOLDS) * len(PCTS) * len(SEEDS)} groups: identical subsets across regimes.')
     return
 
 
@@ -2259,7 +2355,7 @@ def _(mo):
 
 
 @app.cell
-def _(FOLDS, PCTS, REGIMES, SEEDS, mo, np, results):
+def _(ALL_FOLDS, ALL_RESULTS, PCTS, REGIMES, SEEDS, mo, np):
     def ms(vals):
         v = np.array(vals, dtype=float)
         return f"{100 * v.mean():.1f} ± {100 * v.std():.1f}"
@@ -2269,7 +2365,7 @@ def _(FOLDS, PCTS, REGIMES, SEEDS, mo, np, results):
                 "|---:|---:|---|---:|---:|---:|---:|---:|"]
         for p_ in PCTS:
             for mode in REGIMES:
-                sel = [r for r in results if r["pct"] == p_ and r["regime"] == mode]
+                sel = [r for r in ALL_RESULTS if r["pct"] == p_ and r["regime"] == mode]
                 if not sel or f"OA{sfx}" not in sel[0]:
                     continue
                 rows.append(
@@ -2286,7 +2382,7 @@ def _(FOLDS, PCTS, REGIMES, SEEDS, mo, np, results):
                 ("U-TAE (paper)", "88.3 ± 1.2", "90.6 ± 0.9", "80.3 ± 2.3", "69.6 ± 2.7")]
     LEADERBOARD = [("U-TAE (leaderboard, 128²)", "—", "83.2", "—", "63.1")]
     nl = chr(10)
-    mo.md(f"Mean ± std (%) over {len(SEEDS)} seeds × {len(FOLDS)} folds. "
+    mo.md(f"Mean ± std (%) over {len(SEEDS)} seeds × {len(ALL_FOLDS)} test folds {ALL_FOLDS}. "
           "LP / FT / SL correspond to the paper's FR / FT / e2e." + nl + nl
           + "**Paper convention** (Dumeur et al., Table IV): 18 crop classes, "
             "background and void pixels excluded." + nl + nl + table("_crop", PAPER_T4)
@@ -2296,14 +2392,14 @@ def _(FOLDS, PCTS, REGIMES, SEEDS, mo, np, results):
 
 
 @app.cell
-def _(PCTS, REGIMES, np, plt, results):
+def _(ALL_RESULTS, PCTS, REGIMES, np, plt):
     fig_dn, axs_dn = plt.subplots(1, 4, figsize=(15, 3.4))
     dn_styles = {'LP': ('-o', '#4c72b0'), 'FT': ('-s', '#dd8452'), 'SL': ('--^', '#55a868')}
     for ax_d, metric in zip(axs_dn, ['OA_crop', 'mIoU_crop', 'mF1_crop', 'Kappa_crop']):
         for _mode in REGIMES:
-            _xs = [p for p in PCTS if any((r['pct'] == p and r['regime'] == _mode for r in results))]
-            mu = [float(np.mean([r[metric] for r in results if r['pct'] == p and r['regime'] == _mode])) for p in _xs]
-            _sd = [float(np.std([r[metric] for r in results if r['pct'] == p and r['regime'] == _mode])) for p in _xs]
+            _xs = [p for p in PCTS if any((r['pct'] == p and r['regime'] == _mode for r in ALL_RESULTS))]
+            mu = [float(np.mean([r[metric] for r in ALL_RESULTS if r['pct'] == p and r['regime'] == _mode])) for p in _xs]
+            _sd = [float(np.std([r[metric] for r in ALL_RESULTS if r['pct'] == p and r['regime'] == _mode])) for p in _xs]
             fmt, _col = dn_styles.get(_mode, ('-o', None))
             ax_d.errorbar(_xs, mu, yerr=_sd, fmt=fmt, color=_col, capsize=3, ms=4, label=_mode)
         ax_d.set_xscale('log')
@@ -2334,12 +2430,12 @@ def _(PCTS, mo):
 
 
 @app.cell
-def _(CLASS_NAMES, REGIMES, mo, np, results, ui_pc_frac):
+def _(ALL_RESULTS, CLASS_NAMES, REGIMES, mo, np, ui_pc_frac):
     pc_frac = int(ui_pc_frac.value)
     PC_CLASSES = list(range(1, 19))
 
     def pc_stats(mode, key):
-        sel = [r for r in results if r['pct'] == pc_frac and r['regime'] == mode]
+        sel = [r for r in ALL_RESULTS if r['pct'] == pc_frac and r['regime'] == mode]
         arr = np.array([r[key] for r in sel], dtype=float)
         return (np.nanmean(arr, 0), np.nanstd(arr, 0))
     pc_nl = chr(10)
