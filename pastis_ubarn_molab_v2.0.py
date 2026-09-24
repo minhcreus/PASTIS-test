@@ -14,7 +14,7 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # U-BARN on PASTIS · v2.4
+    # U-BARN on PASTIS · v2.4.1
 
     Masked pretraining of a Unet + transformer on Sentinel-2 time series, evaluated
     on PASTIS crop segmentation. Dumeur, Valero & Inglada, JSTARS 17 (2024).
@@ -26,7 +26,7 @@ def _(mo):
 
 @app.cell
 def _():
-    VERSION = "2.4"
+    VERSION = "2.4.1"
     RESULTS_VERSION = ".".join(VERSION.split(".")[:2])   # patch releases stay mergeable
 
     import copy, json, math, os, sys, urllib.request
@@ -1559,7 +1559,7 @@ def _(mo):
 
 
 @app.cell
-def _(DEVICE, P, mo):
+def _(P, mo):
     ui_mask = mo.ui.slider(0.1, 0.9, value=P["mask"], step=0.05, label="mask rate")
     ui_smask = mo.ui.slider(0.0, 0.6, value=P["smask"], step=0.05,
                             label="spatial mask rate (0 = paper)")
@@ -1569,8 +1569,9 @@ def _(DEVICE, P, mo):
     ui_pre_opt = mo.ui.dropdown(["adam+plateau", "adamw+cosine"], value=P["pre_opt"],
                                 label="pretrain optimiser")
     ui_bs = mo.ui.slider(1, 64, value=P["pre_bs"], step=1, label="pretrain batch size")
-    ui_compile = mo.ui.checkbox(DEVICE == "cuda",
-                                label="torch.compile (faster steps; ~1–3 min to compile once per session)")
+    ui_compile = mo.ui.checkbox(False,
+                                label="torch.compile (experimental: crashed on Blackwell with a CUDA "
+                                      "misaligned-address error; restart the kernel if it does)")
     mo.vstack([ui_mask, ui_smask, ui_sblock, ui_pre_epochs, ui_pre_lr, ui_pre_opt, ui_bs, ui_compile])
     return (
         ui_bs,
