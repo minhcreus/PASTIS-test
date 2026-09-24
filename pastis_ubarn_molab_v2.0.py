@@ -14,7 +14,7 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # U-BARN on PASTIS · v2.3.1
+    # U-BARN on PASTIS · v2.4
 
     Masked pretraining of a Unet + transformer on Sentinel-2 time series, evaluated
     on PASTIS crop segmentation. Dumeur, Valero & Inglada, JSTARS 17 (2024).
@@ -26,7 +26,7 @@ def _(mo):
 
 @app.cell
 def _():
-    VERSION = "2.3.1"
+    VERSION = "2.4"
     RESULTS_VERSION = ".".join(VERSION.split(".")[:2])   # patch releases stay mergeable
 
     import copy, json, math, os, sys, urllib.request
@@ -67,6 +67,14 @@ def _():
     USE_SCALER = DEVICE == "cuda" and AMP_DTYPE == torch.float16
     FUSED = DEVICE == "cuda"
 
+    # every run builds and compiles a fresh model; past the cache limit dynamo would
+    # quietly run eager
+    import torch._dynamo as _dynamo
+    for _k in ("cache_size_limit", "recompile_limit", "accumulated_cache_size_limit",
+               "accumulated_recompile_limit"):
+        if hasattr(_dynamo.config, _k):
+            setattr(_dynamo.config, _k, max(getattr(_dynamo.config, _k), 256))
+
     # 0 workers: cell-defined classes cannot be pickled for spawn. Raising this
     # passes a fork context instead (Linux only).
     import multiprocessing as _mp
@@ -79,6 +87,37 @@ def _():
         except ValueError:
             NUM_WORKERS = 0
             print("fork unavailable on this platform — falling back to 0 workers")
+
+
+    def maybe_compile(fn, enabled):
+        """torch.compile with a one-time fallback to eager if compilation fails."""
+        if not enabled:
+            return fn
+        # the transformer's fused inference fast path bakes input strides into the
+        # compiled graph; chunked batches then fail its layout check. The compiler
+        # fuses those ops itself, so the fast path buys nothing here.
+        if hasattr(torch.backends, "mha"):
+            torch.backends.mha.set_fastpath_enabled(False)
+        # automatic dynamic: shapes start fixed; only a dimension that actually varies
+        # (the number of valid frames) becomes symbolic. dynamic=True also makes H and
+        # W symbolic, which breaks compiling the training graph.
+        cfn = torch.compile(fn)
+        state = {"ok": None}
+
+        def wrapper(*a, **k):
+            if state["ok"] is False:
+                return fn(*a, **k)
+            try:
+                out = cfn(*a, **k)
+                state["ok"] = True
+                return out
+            except Exception as err:
+                if state["ok"]:
+                    raise
+                print(f"torch.compile unavailable ({type(err).__name__}); running eager")
+                state["ok"] = False
+                return fn(*a, **k)
+        return wrapper
 
 
     def loader(dataset, batch_size, shuffle, drop_last=False, min_steps=0):
@@ -113,6 +152,7 @@ def _():
         json,
         loader,
         math,
+        maybe_compile,
         nn,
         np,
         os,
@@ -1069,20 +1109,20 @@ def _(mo):
             patches=2433, t_max=48, cache_crop="128", patch="64",
             window="Jan-Nov 2019 (paper)", random_crop=True, flips=False,
             mask=0.6, smask=0.0, pre_epochs=100, pre_lr="1e-3", pre_bs=2, pre_opt="adam+plateau",
-            max_epochs=300, lp_epochs=300, min_epochs=100, patience=20, val_cap=0,
+            max_epochs=150, lp_epochs=150, min_epochs=100, patience=20, val_cap=0,
             lr="1e-3", lp_lr="1e-3", warm=0, dn_bs=2, min_steps=0, lr_scale=False,
             ft_mode="plain", lpft=0, enc_mult="1", loss="CE", cw=False, ls="0",
             ema=False, tta=False, fnorm=False, opt="adam", val_every=5, lr_ref_bs=2,
-            pre_lr_scale=False),
+            pre_lr_scale=False, min_delta=0.002),
         "paper · batch 16": dict(
             patches=2433, t_max=48, cache_crop="128", patch="64",
             window="Jan-Nov 2019 (paper)", random_crop=True, flips=False,
             mask=0.6, smask=0.0, pre_epochs=100, pre_lr="1e-3", pre_bs=16, pre_opt="adam+plateau",
-            max_epochs=300, lp_epochs=300, min_epochs=100, patience=20, val_cap=150,
+            max_epochs=150, lp_epochs=150, min_epochs=100, patience=20, val_cap=150,
             lr="1e-3", lp_lr="1e-3", warm=0, dn_bs=16, min_steps=0, lr_scale=True,
             ft_mode="plain", lpft=0, enc_mult="1", loss="CE", cw=False, ls="0",
             ema=False, tta=False, fnorm=False, opt="adam", val_every=5, lr_ref_bs=2,
-            pre_lr_scale=True),
+            pre_lr_scale=True, min_delta=0.002),
         "improved": dict(
             patches=2433, t_max=48, cache_crop="128", patch="64",
             window="full series (Sep 2018-Nov 2019)", random_crop=True, flips=True,
@@ -1091,7 +1131,7 @@ def _(mo):
             lr="1e-3", lp_lr="1e-2", warm=3, dn_bs=16, min_steps=20, lr_scale=True,
             ft_mode="LP-FT", lpft=10, enc_mult="0.1", loss="CE + Dice", cw=True, ls="0.05",
             ema=True, tta=True, fnorm=True, opt="adamw", val_every=1, lr_ref_bs=4,
-            pre_lr_scale=True),
+            pre_lr_scale=True, min_delta=0.002),
     }
     ui_preset = mo.ui.dropdown(list(PRESETS), value="paper (Dumeur et al. 2024)",
                                label="configuration")
@@ -1519,7 +1559,7 @@ def _(mo):
 
 
 @app.cell
-def _(P, mo):
+def _(DEVICE, P, mo):
     ui_mask = mo.ui.slider(0.1, 0.9, value=P["mask"], step=0.05, label="mask rate")
     ui_smask = mo.ui.slider(0.0, 0.6, value=P["smask"], step=0.05,
                             label="spatial mask rate (0 = paper)")
@@ -1529,9 +1569,12 @@ def _(P, mo):
     ui_pre_opt = mo.ui.dropdown(["adam+plateau", "adamw+cosine"], value=P["pre_opt"],
                                 label="pretrain optimiser")
     ui_bs = mo.ui.slider(1, 64, value=P["pre_bs"], step=1, label="pretrain batch size")
-    mo.vstack([ui_mask, ui_smask, ui_sblock, ui_pre_epochs, ui_pre_lr, ui_pre_opt, ui_bs])
+    ui_compile = mo.ui.checkbox(DEVICE == "cuda",
+                                label="torch.compile (faster steps; ~1–3 min to compile once per session)")
+    mo.vstack([ui_mask, ui_smask, ui_sblock, ui_pre_epochs, ui_pre_lr, ui_pre_opt, ui_bs, ui_compile])
     return (
         ui_bs,
+        ui_compile,
         ui_mask,
         ui_pre_epochs,
         ui_pre_lr,
@@ -1571,11 +1614,13 @@ def _(
     make_loader,
     masked_pixel_loss,
     math,
+    maybe_compile,
     mo,
     run_pre,
     spatiotemporal_mask,
     torch,
     ui_bs,
+    ui_compile,
     ui_mask,
     ui_pre_epochs,
     ui_pre_lr,
@@ -1603,11 +1648,13 @@ def _(
         enc = UBARN(in_ch=N_BANDS, d_model=64, d_hidden=128, n_layers=3, n_heads=4).to(DEVICE)
         dec = LinearDecoder(64, N_BANDS).to(DEVICE)
         prm = list(enc.parameters()) + list(dec.parameters())
+        enc.embed = maybe_compile(enc.embed, ui_compile.value)
+        enc.temporal = maybe_compile(enc.temporal, ui_compile.value)
         n_ep = ui_pre_epochs.value
-        paper_opt = ui_pre_opt.value == 'adam+plateau'
-        if paper_opt:
-            pre_scale = (ui_bs.value / P['lr_ref_bs']) ** 0.5 if P['pre_lr_scale'] else 1.0  # fold 4 images, labels unused: selects the checkpoint, as the paper's
-            opt = torch.optim.Adam(prm, lr=float(ui_pre_lr.value) * pre_scale, fused=FUSED)  # held-out unlabelled validation set does
+        paper_opt = ui_pre_opt.value == 'adam+plateau'  # fold 4 images, labels unused: selects the checkpoint, as the paper's
+        if paper_opt:  # held-out unlabelled validation set does
+            pre_scale = (ui_bs.value / P['lr_ref_bs']) ** 0.5 if P['pre_lr_scale'] else 1.0
+            opt = torch.optim.Adam(prm, lr=float(ui_pre_lr.value) * pre_scale, fused=FUSED)
             sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=10, factor=0.5)
         else:
             opt = torch.optim.AdamW(prm, lr=float(ui_pre_lr.value) * (ui_bs.value / 4) ** 0.5, weight_decay=0.0001, fused=FUSED)
@@ -1676,8 +1723,10 @@ def _(
                 best_v = last_v
                 torch.save({'encoder': enc.state_dict(), 'decoder': dec.state_dict(), 'loss': best_v, 'train_loss': ep_loss, 'epoch': ep, 'history': list(hist), 'val_history': list(vhist), 'mask_rate': ui_mask.value, 'spatial_mask': ui_smask.value, 'spatial_block': int(ui_sblock.value), 'fold': fold_key, 'optimizer': ui_pre_opt.value, 'split_manifest_sha256': MAN.sha256, 'pretrain_ids': sorted(pool)}, out / 'best.pt')
             yield (fold_key, ep, last_v, out / 'best.pt', hist, enc, dec)
+        enc.__dict__.pop('embed', None)
+        enc.__dict__.pop('temporal', None)  # no val set: select on train loss
     CKPTS, HISTORIES, VIZ = ({}, {}, {})
-    todo = [f for f in FOLDS if not ckpt_path(f).exists()]  # no val set: select on train loss
+    todo = [f for f in FOLDS if not ckpt_path(f).exists()]
     total_steps = max(1, len(todo) * ui_pre_epochs.value)
     with mo.status.progress_bar(total=total_steps, title='pretraining') as bar_pre:
         for fk in FOLDS:
@@ -1957,7 +2006,7 @@ def _(
     ui_warm,
 ):
     RESULTS_FILE = WORK / 'results_downstream.json'
-    RUN_SIG = {'version': RESULTS_VERSION, 'folds': FOLDS, 'val_fold': VAL_FOLD, 'pcts': PCTS, 'seeds': SEEDS, 'regimes': REGIMES, 'max_epochs': ui_max_epochs.value, 'lp_epochs': ui_lp_epochs.value, 'patience': ui_patience.value, 'val_cap': ui_val_cap.value, 'lr': ui_lr.value, 'lp_lr': ui_lp_lr.value, 'class_balanced': ui_cw.value, 'feat_norm': ui_fnorm.value, 'save_weights': ui_save_w.value, 'ft_mode': ui_ft_mode.value, 'lpft_epochs': ui_lpft_epochs.value, 'enc_mult': ui_enc_mult.value, 'warmup': ui_warm.value, 'loss': ui_loss.value, 'label_smoothing': ui_ls.value, 'ema': ui_ema.value, 'tta': ui_tta.value, 'data_path': 'gpu' if GPU_STORE is not None else 'cpu', 'dn_bs': ui_dn_bs.value, 'min_steps': ui_min_steps.value, 'min_epochs': ui_min_epochs.value, 'optimizer': ui_opt.value, 'val_every': ui_val_every.value, 'lr_ref_bs': P['lr_ref_bs'], 'lr_scale': ui_lr_scale.value, 'preset': ui_preset.value, 'patch': PATCH, 'random_crop': RANDOM_CROP, 'flips': FLIPS, 'amp': str(AMP_DTYPE), 'cache': str(CACHE_DIR), 'ckpts': {str(k): str(v) for k, v in CKPTS.items()}}
+    RUN_SIG = {'version': RESULTS_VERSION, 'folds': FOLDS, 'val_fold': VAL_FOLD, 'pcts': PCTS, 'seeds': SEEDS, 'regimes': REGIMES, 'max_epochs': ui_max_epochs.value, 'lp_epochs': ui_lp_epochs.value, 'patience': ui_patience.value, 'val_cap': ui_val_cap.value, 'lr': ui_lr.value, 'lp_lr': ui_lp_lr.value, 'class_balanced': ui_cw.value, 'feat_norm': ui_fnorm.value, 'save_weights': ui_save_w.value, 'ft_mode': ui_ft_mode.value, 'lpft_epochs': ui_lpft_epochs.value, 'enc_mult': ui_enc_mult.value, 'warmup': ui_warm.value, 'loss': ui_loss.value, 'label_smoothing': ui_ls.value, 'ema': ui_ema.value, 'tta': ui_tta.value, 'data_path': 'gpu' if GPU_STORE is not None else 'cpu', 'dn_bs': ui_dn_bs.value, 'min_steps': ui_min_steps.value, 'min_epochs': ui_min_epochs.value, 'optimizer': ui_opt.value, 'val_every': ui_val_every.value, 'lr_ref_bs': P['lr_ref_bs'], 'min_delta': P['min_delta'], 'lr_scale': ui_lr_scale.value, 'preset': ui_preset.value, 'patch': PATCH, 'random_crop': RANDOM_CROP, 'flips': FLIPS, 'amp': str(AMP_DTYPE), 'cache': str(CACHE_DIR), 'ckpts': {str(k): str(v) for k, v in CKPTS.items()}}
     PRIOR_RUNS = []
     if RESULTS_FILE.exists():
         with open(RESULTS_FILE) as fh_prev:
@@ -2040,10 +2089,12 @@ def _(
     dice_loss,
     json,
     make_loader,
+    maybe_compile,
     mo,
     np,
     subset_key,
     torch,
+    ui_compile,
     ui_cw,
     ui_dn_bs,
     ui_ema,
@@ -2072,7 +2123,9 @@ def _(
         enc = UBARN(in_ch=N_BANDS, d_model=64, d_hidden=128, n_layers=3, n_heads=4)
         if mode in ('LP', 'FT'):
             enc.load_state_dict(torch.load(CKPTS[fold_key], map_location='cpu')['encoder'])
-        return SegmentationModel(enc, n_classes=N_CLASSES, freeze=mode == 'LP', feat_norm=ui_fnorm.value).to(DEVICE)
+        m = SegmentationModel(enc, n_classes=N_CLASSES, freeze=mode == 'LP', feat_norm=ui_fnorm.value).to(DEVICE)
+        m.forward = maybe_compile(m.forward, ui_compile.value)
+        return m
 
     def class_weights(rows):
         """Inverse-sqrt frequency over the labelled subset; void excluded."""
@@ -2141,11 +2194,14 @@ def _(
         ce = torch.nn.CrossEntropyLoss(weight=weight.to(DEVICE) if weight is not None else None, ignore_index=VOID_CLASS, label_smoothing=float(ui_ls.value))
         use_dice = ui_loss.value == 'CE + Dice'
         ema = EMA(model, 0.99) if ui_ema.value else None
-        ema_model = copy.deepcopy(model) if ema else None
+        ema_model = None
+        if ema:
+            ema_model = copy.deepcopy(model)
+            ema_model.__dict__.pop('forward', None)
         warm = min(ui_warm.value, max(epochs - 1, 0))
         prm = head_p + enc_p
         best, best_state, ran = (-1.0, None, 0)
-        last_val, last_improve = (None, 0)
+        last_val, last_improve, best_ref = (None, 0, -1.0)
         for ep in range(epochs):
             if ep < warm:
                 for g, b0 in zip(opt.param_groups, base_lr):
@@ -2175,14 +2231,16 @@ def _(
                     ema_model.load_state_dict(ema.shadow)
                     target = ema_model
                 last_val = evaluate(target, va_dl).scores()['mIoU']
-                if last_val > best + 1e-05:
-                    best, last_improve = (last_val, ran)
+                if last_val > best:
                     best_state = {k: v.detach().cpu().clone() for k, v in target.state_dict().items()}
+                    if last_val > best_ref + P['min_delta']:
+                        best_ref, last_improve = (last_val, ran)
+                    best = last_val
             if ep >= warm and last_val is not None:
-                sch.step(last_val)
-            if early_stop and do_eval and (ep >= warm) and (ran >= ui_min_epochs.value) and (ran - last_improve >= patience):
-                break  # before the minimum epoch count early stopping cannot fire, so
-        if best_state:  # validation there only picks the best checkpoint: every val_every epochs
+                sch.step(last_val)  # before the minimum epoch count early stopping cannot fire, so
+            if early_stop and do_eval and (ep >= warm) and (ran >= ui_min_epochs.value) and (ran - last_improve >= patience):  # validation there only picks the best checkpoint: every val_every epochs
+                break
+        if best_state:
             model.load_state_dict(best_state)
         return (best, ran)
 
@@ -2272,7 +2330,7 @@ def _(
                         del _m
                         if DEVICE == 'cuda':
                             torch.cuda.empty_cache()
-                        bar_dn.update(increment=cost(pct, _fold_key), subtitle=f'{len(results)}/{N_RUNS} · last: fold {_fold_key}, {pct}%, seed {seed}, {_mode} mIoU {100 * sc['mIoU']:.1f}')
+                        bar_dn.update(increment=cost(pct, _fold_key), subtitle=f'{len(results)}/{N_RUNS} · last: fold {_fold_key}, {pct}%, seed {seed}, {_mode} · {epochs_run} epochs · mIoU(crop) {100 * sc['mIoU_crop']:.1f}')
     with open(WORK / 'label_subsets.json', 'w') as fh:
         json.dump(SUBSETS, fh, indent=2)
     mo.md(f'{len(results)}/{N_RUNS} runs' + (' (loaded from disk)' if DN_READY else ''))
