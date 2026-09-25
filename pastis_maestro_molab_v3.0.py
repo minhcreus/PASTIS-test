@@ -14,7 +14,7 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # MAESTRO on PASTIS · v3.0.2
+    # MAESTRO on PASTIS · v3.1
 
     Masked-autoencoder pretraining (Labatie et al. 2025, arXiv 2508.10894) on Sentinel-2 time series; label efficiency under a fixed protocol: fold 4 validation, LP / FT / SL on identical nested subsets, mean ± std over seeds.
 
@@ -25,7 +25,7 @@ def _(mo):
 
 @app.cell
 def _():
-    VERSION = "3.0.2"
+    VERSION = "3.1"
     import time as time_mod
     SESSION_T0 = time_mod.time()
     RESULTS_VERSION = ".".join(VERSION.split(".")[:2])
@@ -986,14 +986,17 @@ def _(mo):
 @app.cell
 def _(mo):
     MAESTRO_EP = {"ft": {5: 200, 20: 100, 100: 50}, "lp": {5: 40, 20: 20, 100: 10}}
+    EFF = dict(ft_scale=0.25, lpft=True, layer_decay=0.75, ft_lr=2e-5, sl_lr=4e-5)
     CFG_PRESETS = {
-        "MAESTRO · Tiny encoder (full grid in ~1 session/fold)": dict(model="tiny"),
-        "MAESTRO · Small encoder": dict(model="small"),
-        "MAESTRO · Base encoder (paper; single-seed anchor runs)": dict(model="base"),
+        "Efficient · Tiny (LP-FT, 1/4 schedule, layer decay)": dict(model="tiny", **EFF),
+        "Efficient · Small (LP-FT, 1/4 schedule, layer decay)": dict(model="small", **EFF),
+        "MAESTRO schedule · Tiny": dict(model="tiny"),
+        "MAESTRO schedule · Base (paper)": dict(model="base"),
     }
     COMMON = dict(crop=16, patch=2, bins=16, mask=0.75, p_space=0.25, p_time=0.25, p_block=0.5,
                   block_lo=0.25, block_hi=0.5, pre_epochs=100, pre_bs=72, pre_lr=3e-5,
-                  dn_bs=48, ft_lr=1e-5, lp_lr=1e-5, ft_final_div=2.0, pre_final_div=1e4,
+                  dn_bs=48, ft_lr=1e-5, lp_lr=1e-5, sl_lr=1e-5, ft_final_div=2.0, pre_final_div=1e4,
+                  ft_scale=1.0, lp_scale=1.0, lpft=False, layer_decay=1.0, val_crops=16,
                   wd=0.01, warm_frac=0.2, val_every=5, patience_frac=0.3, min_frac=0.5,
                   min_delta=0.002, val_cap=150, t_max=61)
     ui_preset = mo.ui.dropdown(list(CFG_PRESETS), value=list(CFG_PRESETS)[0], label="configuration")
@@ -1281,14 +1284,38 @@ def _(
         return predict_tiles(model, [r])[0]
 
 
-    def evaluate_rows(model, rows, group=8):
+    VAL_CROPS = torch.tensor([q for q in range((128 // CROP) ** 2)
+                              if (q // (128 // CROP)) % 2 == 0 and (q % (128 // CROP)) % 2 == 0])
+    VAL_CROPS_DEV = VAL_CROPS.to(DEVICE)
+
+
+    @torch.no_grad()
+    def predict_crop_subset(model, rows_g, crops, bs=512):
+        parts = [tile_crops(int(r)) for r in rows_g]
+        xc = torch.cat([p_[0][crops.to(p_[0].device)] for p_ in parts])
+        tf = torch.cat([p_[1][crops.to(p_[1].device)] for p_ in parts])
+        outs = []
+        for a in range(0, xc.shape[0], bs):
+            with torch.autocast(DEVICE, dtype=AMP_DTYPE, enabled=AMP_ON):
+                lg = model(xc[a:a + bs], tf[a:a + bs]).float()
+            lg[:, VOID_CLASS] = float("-inf")
+            outs.append(lg.argmax(1))
+        ys = torch.cat([tile_to_crops(Y_ALL[int(r)].to(DEVICE), CROP)[crops.to(DEVICE)] for r in rows_g])
+        return torch.cat(outs), ys
+
+
+    def evaluate_rows(model, rows, group=8, crops=None):
         model.eval()
         meter = ConfusionMeter(N_CLASSES, ignore_index=VOID_CLASS)
         rows = [int(r) for r in rows]
         for a in range(0, len(rows), group):
             g = rows[a:a + group]
-            for r, pr in zip(g, predict_tiles(model, g)):
-                meter.update(pr, Y_ALL[r].to(DEVICE))
+            if crops is None:
+                for r, pr in zip(g, predict_tiles(model, g)):
+                    meter.update(pr, Y_ALL[r].to(DEVICE))
+            else:
+                pr, ys = predict_crop_subset(model, g, crops)
+                meter.update(pr, ys)
         return meter
 
 
@@ -1302,7 +1329,7 @@ def _(
         return f
 
     mo.md(store_note)
-    return epoch_rows, evaluate_rows, lr_lambda, train_batch
+    return VAL_CROPS_DEV, epoch_rows, evaluate_rows, lr_lambda, train_batch
 
 
 @app.cell
@@ -1617,6 +1644,9 @@ def _(FOLDS, MAN, Path, WORK, ckpt_path, json, mo, torch, ui_restore):
                     for zn in z.namelist():
                         if zn.startswith('pretrain/') and zn.endswith('.pt'):
                             _restore_ckpt(zn, z.read(zn))
+                        elif zn.startswith('lp_heads/') and zn.endswith('.pt'):
+                            (WORK / 'lp_heads').mkdir(parents=True, exist_ok=True)
+                            (WORK / 'lp_heads' / Path(zn).name).write_bytes(z.read(zn))
                         elif zn.startswith('downstream/') and zn.endswith('.pt'):
                             (WORK / 'weights').mkdir(parents=True, exist_ok=True)
                             (WORK / 'weights' / Path(zn).name).write_bytes(z.read(zn))
@@ -1746,9 +1776,16 @@ def _(mo):
 def _(P, mo):
     ui_pcts = mo.ui.multiselect(["1", "5", "10", "20", "50", "100"], value=["5", "10", "20", "50", "100"],
                                 label="label fractions (%)")
-    ui_nseeds = mo.ui.dropdown(["3", "5"], value="3", label="seeds")
+    ui_nseeds = mo.ui.dropdown(["1", "3", "5"], value="3", label="seeds (1 = pilot)")
     ui_regimes = mo.ui.multiselect(["LP", "FT", "SL"], value=["LP", "FT", "SL"], label="regimes")
-    ui_ep_scale = mo.ui.slider(0.1, 1.0, value=1.0, step=0.05, label="epoch scale (1 = MAESTRO schedule)")
+    ui_ep_scale = mo.ui.slider(0.05, 1.0, value=P["ft_scale"], step=0.05,
+                              label="FT / SL epoch scale (1 = MAESTRO schedule)")
+    ui_lp_scale = mo.ui.slider(0.1, 1.0, value=P["lp_scale"], step=0.05, label="LP epoch scale")
+    ui_lpft = mo.ui.checkbox(P["lpft"], label="FT starts from the LP head of the same subset and seed (LP-FT)")
+    ui_decay = mo.ui.slider(0.5, 1.0, value=P["layer_decay"], step=0.05,
+                            label="FT layer-wise lr decay (1 = off)")
+    ui_val_crops = mo.ui.dropdown(["16", "64"], value=str(P["val_crops"]),
+                                  label="validation crops per fold-4 tile (test always uses all 64)")
     ui_val_every = mo.ui.slider(1, 10, value=P["val_every"], step=1, label="validate on fold 4 every N epochs")
     ui_patience = mo.ui.slider(0.1, 1.0, value=P["patience_frac"], step=0.05,
                                label="early-stop patience (fraction of planned epochs)")
@@ -1759,19 +1796,23 @@ def _(P, mo):
                              label="stop ③ before this many hours of session time (molab ends at 12)")
     ui_save_w = mo.ui.dropdown(["off", "best seed per (fold, regime, fraction)", "all runs"],
                                value="best seed per (fold, regime, fraction)", label="save downstream weights")
-    mo.vstack([ui_pcts, ui_nseeds, ui_regimes, ui_ep_scale, ui_val_every, ui_patience, ui_val_cap,
-               ui_dn_bs, ui_ema, ui_budget, ui_save_w])
+    mo.vstack([ui_pcts, ui_nseeds, ui_regimes, ui_ep_scale, ui_lp_scale, ui_lpft, ui_decay,
+               ui_val_every, ui_patience, ui_val_cap, ui_val_crops, ui_dn_bs, ui_ema, ui_budget, ui_save_w])
     return (
         ui_budget,
+        ui_decay,
         ui_dn_bs,
         ui_ema,
         ui_ep_scale,
+        ui_lp_scale,
+        ui_lpft,
         ui_nseeds,
         ui_patience,
         ui_pcts,
         ui_regimes,
         ui_save_w,
         ui_val_cap,
+        ui_val_crops,
         ui_val_every,
     )
 
@@ -1788,10 +1829,12 @@ def _(
     mo,
     np,
     ui_ep_scale,
+    ui_lp_scale,
     ui_nseeds,
     ui_pcts,
     ui_regimes,
     ui_val_cap,
+    ui_val_crops,
     ui_val_every,
 ):
     PCTS = sorted((int(v) for v in ui_pcts.value))
@@ -1807,7 +1850,7 @@ def _(
         v = np.exp(np.interp(np.log(pct), lx, ly, left=None, right=None))
         if pct < xs[0]:
             v = tbl[xs[0]] * (tbl[xs[0]] / tbl[xs[1]]) ** (np.log(xs[0] / pct) / np.log(xs[1] / xs[0]))
-        return max(1, int(round(v * ui_ep_scale.value)))
+        return max(1, int(round(v * (ui_lp_scale.value if mode == 'LP' else ui_ep_scale.value))))
     GF = {'tiny': (32.7, 10.9), 'small': (87.1, 29.0), 'base': (348.1, 116.0)}[P['model']]
     n_tr = {f: len([i for i in RUNS[f]['train'] if i in cache.pos]) for f in FOLDS}
     flops = 0.0
@@ -1817,7 +1860,7 @@ def _(
             for m_ in REGIMES:
                 e_ = planned_epochs(m_, p_)
                 flops += len(SEEDS) * n_ * e_ * (GF[1] if m_ == 'LP' else GF[0]) * 1000000000.0
-                flops += len(SEEDS) * (e_ / ui_val_every.value) * (ui_val_cap.value or 482) * REP * GF[1] * 1000000000.0
+                flops += len(SEEDS) * (e_ / ui_val_every.value + 1) * (ui_val_cap.value or 482) * int(ui_val_crops.value) * GF[1] * 1000000000.0
     ep_lines = '  '.join((f'{p}%: FT/SL {planned_epochs('FT', p)} · LP {planned_epochs('LP', p)}' for p in PCTS))
     mo.md(f'```\nregimes {', '.join(REGIMES)} | fractions {PCTS} | seeds {SEEDS} | test folds {FOLDS} | runs {N_RUNS}\nplanned epochs ({REP} crops per tile per epoch): {ep_lines}\ncompute ≈ {flops / 1e+18:.1f} EFLOP -> ~{flops / 150000000000000.0 / 3600:.0f} h at 150 TFLOP/s, ~{flops / 50000000000000.0 / 3600:.0f} h at 50\nearly stopping may end runs sooner; the progress bar gives the real rate\n```')
     return N_RUNS, PCTS, REGIMES, SEEDS, planned_epochs
@@ -1854,9 +1897,12 @@ def _(
     mo,
     np,
     run_dn,
+    ui_decay,
     ui_dn_bs,
     ui_ema,
     ui_ep_scale,
+    ui_lp_scale,
+    ui_lpft,
     ui_mask,
     ui_patience,
     ui_pblock,
@@ -1868,10 +1914,11 @@ def _(
     ui_ptime,
     ui_save_w,
     ui_val_cap,
+    ui_val_crops,
     ui_val_every,
 ):
     RESULTS_FILE = WORK / 'results_downstream.json'
-    RUN_SIG = {'version': RESULTS_VERSION, 'method': 'MAESTRO', 'folds': FOLDS, 'val_fold': VAL_FOLD, 'pcts': PCTS, 'seeds': SEEDS, 'regimes': REGIMES, 'model': P['model'], 'bins': BINS, 'crop': CROP, 'patch': PATCH_SZ, 'ep_scale': ui_ep_scale.value, 'val_every': ui_val_every.value, 'patience_frac': ui_patience.value, 'min_frac': P['min_frac'], 'min_delta': P['min_delta'], 'val_cap': ui_val_cap.value, 'dn_bs': ui_dn_bs.value, 'ema': ui_ema.value, 'ft_lr': P['ft_lr'], 'lp_lr': P['lp_lr'], 'ft_final_div': P['ft_final_div'], 'wd': P['wd'], 'save_weights': ui_save_w.value, 'pretrain': {'mask': ui_mask.value, 'p_space': ui_pspace.value, 'p_time': ui_ptime.value, 'p_block': ui_pblock.value, 'epochs': ui_pre_epochs.value, 'bs': ui_pre_bs.value, 'with_val_images': ui_pre_val.value}, 'preset': ui_preset.value, 'amp': str(AMP_DTYPE), 'cache': str(CACHE_DIR), 'ckpts': {str(k): str(v) for k, v in CKPTS.items()}}
+    RUN_SIG = {'version': RESULTS_VERSION, 'method': 'MAESTRO', 'folds': FOLDS, 'val_fold': VAL_FOLD, 'pcts': PCTS, 'seeds': SEEDS, 'regimes': REGIMES, 'model': P['model'], 'bins': BINS, 'crop': CROP, 'patch': PATCH_SZ, 'ep_scale': ui_ep_scale.value, 'val_every': ui_val_every.value, 'patience_frac': ui_patience.value, 'min_frac': P['min_frac'], 'min_delta': P['min_delta'], 'val_cap': ui_val_cap.value, 'dn_bs': ui_dn_bs.value, 'ema': ui_ema.value, 'ft_lr': P['ft_lr'], 'lp_lr': P['lp_lr'], 'ft_final_div': P['ft_final_div'], 'wd': P['wd'], 'save_weights': ui_save_w.value, 'sl_lr': P['sl_lr'], 'lp_scale': ui_lp_scale.value, 'lpft': ui_lpft.value, 'layer_decay': ui_decay.value, 'val_crops': ui_val_crops.value, 'pretrain': {'mask': ui_mask.value, 'p_space': ui_pspace.value, 'p_time': ui_ptime.value, 'p_block': ui_pblock.value, 'epochs': ui_pre_epochs.value, 'bs': ui_pre_bs.value, 'with_val_images': ui_pre_val.value}, 'preset': ui_preset.value, 'amp': str(AMP_DTYPE), 'cache': str(CACHE_DIR), 'ckpts': {str(k): str(v) for k, v in CKPTS.items()}}
 
     def sig_core(sig):
         """Settings that define a run. Which folds a session lists does not change a
@@ -1974,6 +2021,7 @@ def _(
     SESSION_T0,
     SUBSETS,
     Segmenter,
+    VAL_CROPS_DEV,
     VAL_IDS,
     VOID_CLASS,
     WORK,
@@ -1991,14 +2039,34 @@ def _(
     torch,
     train_batch,
     ui_budget,
+    ui_decay,
     ui_dn_bs,
     ui_ema,
+    ui_lpft,
     ui_patience,
     ui_save_w,
+    ui_val_crops,
     ui_val_every,
 ):
     WEIGHT_DIR = WORK / 'weights'
     BEST_SO_FAR = {}
+
+    def param_groups(model, lr, decay):
+        depth = len(model.encoder.blocks)
+        groups = {}
+        for n, p_ in model.named_parameters():
+            if not p_.requires_grad:
+                continue
+            if n.startswith('encoder.blocks.'):
+                lid = int(n.split('.')[2]) + 1
+            elif n.startswith('encoder.norm'):
+                lid = depth + 1
+            elif n.startswith('encoder.'):
+                lid = 0
+            else:
+                lid = depth + 1
+            groups.setdefault(decay ** (depth + 1 - lid), []).append(p_)
+        return [{'params': ps, 'lr': lr * sc} for sc, ps in sorted(groups.items())]
 
     def build_model(mode, fold_key):
         enc = Encoder(in_ch=N_BANDS, patch=PATCH_SZ, crop=CROP, **PRESETS[P['model']])
@@ -2010,12 +2078,18 @@ def _(
         torch.manual_seed(seed)
         gen = torch.Generator().manual_seed(10000 + seed)
         model = build_model(mode, fold_key)
+        head_file = WORK / 'lp_heads' / f'f{fold_key}_p{pct}_s{seed}.pt'
+        lpft_init = False
+        if mode == 'FT' and ui_lpft.value and head_file.exists():
+            miss = model.load_state_dict(torch.load(head_file, map_location='cpu'), strict=False)
+            assert not miss.unexpected_keys and all((k.startswith('encoder.') for k in miss.missing_keys))
+            lpft_init = True
         n_ep = planned_epochs(mode, pct)
         bs = min(ui_dn_bs.value, len(tr_rows) * REP)
-        base = P['lp_lr'] if mode == 'LP' else P['ft_lr']
+        base = {'LP': P['lp_lr'], 'FT': P['ft_lr'], 'SL': P['sl_lr']}[mode]
         final_div = P['pre_final_div'] if mode == 'LP' else P['ft_final_div']
-        params = [p for p in model.parameters() if p.requires_grad]
-        opt = torch.optim.AdamW(params, lr=base * bs ** 0.5, betas=(0.9, 0.99), weight_decay=P['wd'], fused=FUSED)
+        groups = param_groups(model, base * bs ** 0.5, ui_decay.value if mode == 'FT' else 1.0)
+        opt = torch.optim.AdamW(groups, betas=(0.9, 0.99), weight_decay=P['wd'], fused=FUSED)
         spe = -(-len(tr_rows) * REP // bs)
         sch = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda(spe * n_ep, P['warm_frac'], final_div))
         ema = EpochEMA(model, n_ep) if ui_ema.value and mode != 'LP' else None
@@ -2037,12 +2111,12 @@ def _(
             ran = ep + 1
             if ema:
                 ema.update(model)
-            if ran % ui_val_every.value == 0 or ran == n_ep or ran >= min_ep:
+            if ran % ui_val_every.value == 0 or ran == n_ep:
                 target = model
                 if ema:
                     shadow.load_state_dict(ema.shadow)
                     target = shadow
-                v = evaluate_rows(target, va_rows).scores()['mIoU']
+                v = evaluate_rows(target, va_rows, crops=None if ui_val_crops.value == '64' else VAL_CROPS_DEV).scores()['mIoU']
                 if v > best:
                     best = v
                     best_state = {k: t.detach().cpu().clone() for k, t in target.state_dict().items()}
@@ -2051,7 +2125,10 @@ def _(
                 if ran >= min_ep and ran - last_imp >= patience:
                     break
         model.load_state_dict(best_state)
-        return (model, best, ran, n_ep)
+        if mode == 'LP':
+            head_file.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({k: v for k, v in best_state.items() if not k.startswith('encoder.')}, head_file)
+        return (model, best, ran, n_ep, lpft_init)
 
     def save_run_weights(model, fold_key, pct, seed, mode, score, meta):
         if ui_save_w.value == 'off':
@@ -2084,7 +2161,8 @@ def _(
             k_best = (_r['fold'], _r['regime'], _r['pct'])
             BEST_SO_FAR[k_best] = max(BEST_SO_FAR.get(k_best, -1.0), _r['mIoU'])
     todo_runs = [(f, p, sd, m_) for f in FOLDS for p in PCTS for sd in SEEDS for m_ in REGIMES if (f, p, sd, m_) not in DONE]
-    cost = lambda p_, f_, m_: len(SUBSETS[subset_key(f_, p_, 0)]) * planned_epochs(m_, p_) * (1 if m_ == 'LP' else 3) + len(VAL_IDS[f_]) * planned_epochs(m_, p_) // ui_val_every.value
+    cost = lambda p_, f_, m_: len(SUBSETS[subset_key(f_, p_, 0)]) * planned_epochs(m_, p_) * (1 if m_ == 'LP' else 3) + len(VAL_IDS[f_]) * (planned_epochs(m_, p_) // ui_val_every.value + 1) * int(ui_val_crops.value) // REP_EVAL
+    REP_EVAL = (128 // CROP) ** 2
     total_cost = sum((cost(p_, f_, m_) for f_, p_, _, m_ in todo_runs))
     budget_s = ui_budget.value * 3600
     units_done, secs_done, STOPPED_EARLY = (0, 0.0, False)
@@ -2098,10 +2176,10 @@ def _(
             t_run = time_mod.time()
             ids_used = SUBSETS[subset_key(_fold_key, pct, seed)]
             tr_rows = cache.indices_for(ids_used)
-            _m, val_best, epochs_run, n_ep = train_run(_mode, _fold_key, tr_rows, VAL_IDS[_fold_key], pct, seed)
+            _m, val_best, epochs_run, n_ep, lpft_init = train_run(_mode, _fold_key, tr_rows, VAL_IDS[_fold_key], pct, seed)
             sc = evaluate_rows(_m, cache.indices_for(RUNS[_fold_key]['test'])).scores()
             wpath = save_run_weights(_m, _fold_key, pct, seed, _mode, sc['mIoU'], {k: sc[k] for k in ('OA', 'mIoU', 'mF1', 'Kappa')})
-            results.append({'weights': wpath, 'fold': _fold_key, 'pct': pct, 'seed': seed, 'regime': _mode, 'n_train': len(tr_rows), 'epochs_run': epochs_run, 'epochs_planned': n_ep, 'val_mIoU': val_best, 'subset_sig': ','.join(sorted(ids_used))[:64], **{k: v for k, v in sc.items()}})
+            results.append({'weights': wpath, 'fold': _fold_key, 'pct': pct, 'seed': seed, 'regime': _mode, 'n_train': len(tr_rows), 'epochs_run': epochs_run, 'epochs_planned': n_ep, 'lpft_init': lpft_init, 'val_mIoU': val_best, 'subset_sig': ','.join(sorted(ids_used))[:64], **{k: v for k, v in sc.items()}})
             save_results(results)
             del _m
             if DEVICE == 'cuda':
@@ -2381,6 +2459,8 @@ def _(FOLDS, VERSION, WORK, ckpt_path, json, mo, run_dl):
         with _zf3.ZipFile(buf_b, "w", _zf3.ZIP_STORED, allowZip64=True) as zb:
             for q in dl_pre:
                 zb.write(q, f"pretrain/{q.parent.name}.pt")
+            for q in sorted((WORK / "lp_heads").glob("*.pt")):
+                zb.write(q, f"lp_heads/{q.name}")
             for q in (DL_RESULTS, DL_SUBSETS):
                 if q.exists():
                     zb.write(q, q.name)
