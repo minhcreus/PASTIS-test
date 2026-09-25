@@ -14,7 +14,7 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # MAESTRO on PASTIS · v3.0.1
+    # MAESTRO on PASTIS · v3.0.2
 
     Masked-autoencoder pretraining (Labatie et al. 2025, arXiv 2508.10894) on Sentinel-2 time series; label efficiency under a fixed protocol: fold 4 validation, LP / FT / SL on identical nested subsets, mean ± std over seeds.
 
@@ -25,7 +25,7 @@ def _(mo):
 
 @app.cell
 def _():
-    VERSION = "3.0.1"
+    VERSION = "3.0.2"
     import time as time_mod
     SESSION_T0 = time_mod.time()
     RESULTS_VERSION = ".".join(VERSION.split(".")[:2])
@@ -1157,7 +1157,65 @@ def _(
         return torch.from_numpy(np.asarray(cache.x[r, :t])).to(DEVICE)
 
 
+    def batch_draws(rows_b, gen, augment=True):
+        """All random choices for one batch, drawn on the CPU in one go."""
+        rng = np.random.default_rng(int(torch.randint(0, 2 ** 62, (1,), generator=gen)))
+        r = np.asarray(rows_b, dtype=np.int64)
+        B = len(r)
+        T = T_LEN[r]
+        k = np.maximum(T // BINS, 1)
+        L = k * BINS
+        start = rng.integers(0, np.maximum(T - L, 0) + 1)
+        pick = np.floor(rng.random((B, BINS)) * k[:, None]).astype(np.int64)
+        idx = start[:, None] + np.arange(BINS)[None] * k[:, None] + pick
+        short = T < BINS
+        if short.any():
+            idx[short] = np.floor(np.arange(BINS)[None] * T[short, None] / BINS).astype(np.int64)
+        idx = np.minimum(idx, T[:, None] - 1)
+        ij = rng.integers(0, 128 - CROP + 1, size=(B, 2))
+        rot = rng.integers(0, 4, size=B) if augment else np.zeros(B, np.int64)
+        flip = (rng.random(B) < 0.5).astype(np.int64) if augment else np.zeros(B, np.int64)
+        return np.concatenate([r[:, None], ij, rot[:, None], flip[:, None], idx], 1)
+
+
+    PIX = torch.arange(CROP)
+    T_MAX = cache.x.shape[1]
+
+
+    def assemble(draws, xsrc, ysrc, tsrc, dev):
+        """Build a batch from packed draws with a few tensor ops (no per-sample loop)."""
+        B = draws.shape[0]
+        r, i, j, rot, flip, idx = (draws[:, 0], draws[:, 1], draws[:, 2], draws[:, 3],
+                                   draws[:, 4], draws[:, 5:])
+        pix = PIX.to(dev)
+        lin = (i[:, None, None] + pix[None, :, None]) * 128 + (j[:, None, None] + pix[None, None, :])
+        lin = lin.reshape(B, 1, 1, CROP * CROP)
+        C = xsrc.shape[2]
+        frame = (r[:, None] * T_MAX + idx)[:, :, None, None]
+        chan = torch.arange(C, device=dev)[None, None, :, None]
+        x = torch.take(xsrc, (frame * C + chan) * (128 * 128) + lin).reshape(B, BINS, C, CROP, CROP).float()
+        y = torch.take(ysrc, r[:, None] * (128 * 128) + lin.reshape(B, -1)).reshape(B, CROP, CROP)
+        tf = tsrc[r[:, None], idx]
+        xr = torch.stack([torch.rot90(x, q, (-2, -1)) for q in range(4)])
+        yr = torch.stack([torch.rot90(y, q, (-2, -1)) for q in range(4)])
+        ar = torch.arange(B, device=dev)
+        x, y = xr[rot, ar], yr[rot, ar]
+        f = flip.bool()
+        x = torch.where(f[:, None, None, None, None], x.flip(-1), x)
+        y = torch.where(f[:, None, None], y.flip(-1), y)
+        return x, tf, y
+
+
     def train_batch(rows_b, gen, augment=True):
+        if X_GPU is not None:
+            d = torch.from_numpy(batch_draws(rows_b, gen, augment))
+            if DEVICE == "cuda":
+                d = d.pin_memory().to(DEVICE, non_blocking=True)
+            return assemble(d, X_GPU, Y_ALL, TFEAT_DEV, X_GPU.device)
+        return train_batch_slow(rows_b, gen, augment)
+
+
+    def train_batch_slow(rows_b, gen, augment=True):
         xs, tfs, ys = [], [], []
         for r in rows_b:
             r = int(r)
@@ -1185,36 +1243,52 @@ def _(
         """Non-overlapping crops of one tile with eval bin selection per crop."""
         xt = tile_x(r)
         T = xt.shape[0]
-        k = max(1, T // BINS)
-        L = k * BINS
-        s0 = (T - L) // 2
-        xc = tile_to_crops(xt[s0:s0 + L], CROP)
-        n = xc.shape[0]
-        xb = xc.reshape(n, BINS, k, -1).float()
-        mad = (xb - xb.median(dim=2, keepdim=True).values).abs().mean(-1)
-        idx = s0 + torch.arange(BINS, device=xc.device)[None] * k + mad.argmin(2)
+        if T < BINS:
+            s0 = 0
+            xc = tile_to_crops(xt, CROP)
+            n = xc.shape[0]
+            idx = (torch.arange(BINS, device=xc.device) * T // BINS)[None].expand(n, -1)
+        else:
+            k = T // BINS
+            L = k * BINS
+            s0 = (T - L) // 2
+            xc = tile_to_crops(xt[s0:s0 + L], CROP)
+            n = xc.shape[0]
+            xb = xc.reshape(n, BINS, k, -1).float()
+            mad = (xb - xb.median(dim=2, keepdim=True).values).abs().mean(-1)
+            idx = s0 + torch.arange(BINS, device=xc.device)[None] * k + mad.argmin(2)
         sel = torch.gather(xc, 1, (idx - s0)[:, :, None, None, None].expand(-1, -1, *xc.shape[2:]))
         tf = TFEAT_DEV[r][idx.to(TFEAT_DEV.device)]
         return sel.float(), tf
 
 
     @torch.no_grad()
-    def predict_tile(model, r, bs=256):
-        xc, tf = tile_crops(r)
+    def predict_tiles(model, rows_g, bs=512):
+        parts = [tile_crops(int(r)) for r in rows_g]
+        xc = torch.cat([p_[0] for p_ in parts]); tf = torch.cat([p_[1] for p_ in parts])
         outs = []
         for a in range(0, xc.shape[0], bs):
             with torch.autocast(DEVICE, dtype=AMP_DTYPE, enabled=AMP_ON):
                 lg = model(xc[a:a + bs], tf[a:a + bs]).float()
             lg[:, VOID_CLASS] = float("-inf")
             outs.append(lg.argmax(1))
-        return crops_to_tile(torch.cat(outs), 128, 128)
+        pred = torch.cat(outs)
+        n = pred.shape[0] // len(rows_g)
+        return [crops_to_tile(pred[q * n:(q + 1) * n], 128, 128) for q in range(len(rows_g))]
 
 
-    def evaluate_rows(model, rows):
+    def predict_tile(model, r):
+        return predict_tiles(model, [r])[0]
+
+
+    def evaluate_rows(model, rows, group=8):
         model.eval()
         meter = ConfusionMeter(N_CLASSES, ignore_index=VOID_CLASS)
-        for r in rows:
-            meter.update(predict_tile(model, int(r)), Y_ALL[int(r)].to(DEVICE))
+        rows = [int(r) for r in rows]
+        for a in range(0, len(rows), group):
+            g = rows[a:a + group]
+            for r, pr in zip(g, predict_tiles(model, g)):
+                meter.update(pr, Y_ALL[r].to(DEVICE))
         return meter
 
 
