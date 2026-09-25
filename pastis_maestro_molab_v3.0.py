@@ -14,7 +14,7 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # MAESTRO on PASTIS · v3.0
+    # MAESTRO on PASTIS · v3.0.1
 
     Masked-autoencoder pretraining (Labatie et al. 2025, arXiv 2508.10894) on Sentinel-2 time series; label efficiency under a fixed protocol: fold 4 validation, LP / FT / SL on identical nested subsets, mean ± std over seeds.
 
@@ -25,7 +25,7 @@ def _(mo):
 
 @app.cell
 def _():
-    VERSION = "3.0"
+    VERSION = "3.0.1"
     import time as time_mod
     SESSION_T0 = time_mod.time()
     RESULTS_VERSION = ".".join(VERSION.split(".")[:2])
@@ -696,7 +696,7 @@ def _(math, nn, torch):
             B, D = x.shape[:2]
             S = self.encoder.g ** 2
             z = self.dec_embed(self.encoder(x, tfeat, keep))
-            full = self.mask_token.expand(B, D * S, -1).clone()
+            full = self.mask_token.to(z.dtype).expand(B, D * S, -1).clone()
             full.scatter_(1, keep[..., None].expand(-1, -1, z.shape[-1]), z)
             pe = torch.cat([self.dpos[None, None].expand(B, D, S, -1), self.dec_te(tfeat)[:, :, None].expand(B, D, S, 8)], -1)
             h = full + pe.reshape(B, D * S, -1)
